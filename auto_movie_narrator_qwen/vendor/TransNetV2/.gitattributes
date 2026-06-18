@@ -1,0 +1,3 @@
+# Keep vendored TransNetV2 assets in normal Git for this repository snapshot.
+# The original upstream project uses Git LFS for TensorFlow weights, but this
+# mirror should be pushable without requiring repository-level LFS setup.

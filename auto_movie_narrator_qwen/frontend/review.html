@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>电影解说审核台</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 32px; line-height: 1.6; }
+    .grid { display: grid; grid-template-columns: 2fr 1fr; gap: 24px; }
+    video { width: 100%; background: #111; border-radius: 12px; }
+    pre { background: #f6f6f6; padding: 16px; border-radius: 12px; overflow: auto; }
+    button { padding: 10px 14px; margin: 4px; border-radius: 8px; border: 1px solid #ccc; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <h1>电影解说审核台</h1>
+  <p>Task ID: <code id="taskId">{{TASK_ID}}</code></p>
+  <div class="grid">
+    <main>
+      <h2>成片预览</h2>
+      <video id="video" controls></video>
+      <h2>解说稿</h2>
+      <pre id="script">loading...</pre>
+    </main>
+    <aside>
+      <h2>任务状态</h2>
+      <pre id="task">loading...</pre>
+      <h2>自动质检</h2>
+      <pre id="quality">loading...</pre>
+      <h2>操作</h2>
+      <button onclick="review('approved')">审核通过</button>
+      <button onclick="review('rejected')">驳回</button>
+      <button onclick="review('regenerate_script')">只重写稿</button>
+      <button onclick="review('regenerate_voice')">只重配音</button>
+      <button onclick="review('regenerate_clips')">只重剪辑</button>
+    </aside>
+  </div>
+<script>
+const taskId = document.getElementById('taskId').innerText;
+async function loadJson(url, target) {
+  const el = document.getElementById(target);
+  try {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(await res.text());
+    el.innerText = JSON.stringify(await res.json(), null, 2);
+  } catch (e) { el.innerText = String(e); }
+}
+async function refresh() {
+  await loadJson(`/tasks/${taskId}`, 'task');
+  await loadJson(`/tasks/${taskId}/artifacts/quality_report`, 'quality');
+  await loadJson(`/tasks/${taskId}/artifacts/script`, 'script');
+  document.getElementById('video').src = `/tasks/${taskId}/artifacts/final_video`;
+}
+async function review(decision) {
+  const comment = prompt('审核备注：') || '';
+  const res = await fetch(`/tasks/${taskId}/review`, {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({decision, reviewer: 'human', comment})
+  });
+  alert(await res.text());
+  refresh();
+}
+refresh();
+</script>
+</body>
+</html>
