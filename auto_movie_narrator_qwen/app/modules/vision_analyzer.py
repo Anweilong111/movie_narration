@@ -30,6 +30,15 @@ def analyze_scenes(
                 evidence_quotes=_quote_transcript(scene.transcript),
                 events=[scene.transcript[:80] or '剧情推进'],
                 emotion='悬疑', importance=0.7, clip_value='high',
+                visual_function='反应镜头',
+                shot_type='medium',
+                motion_level=0.45,
+                face_visible=True,
+                visual_quality=0.72,
+                brightness='normal',
+                subtitle_safe_area='bottom_safe',
+                best_use='conflict',
+                bad_clip_reason='',
                 anchor_start=scene.start, anchor_end=min(scene.end, scene.start + 12.0),
                 transition_hint='承接上一段线索，继续推进悬疑。'
             ))
@@ -60,7 +69,7 @@ def _analyze_one_scene(scene: Scene, output_json: str, detail_frame_limit: int |
     detail_paths, detail_times = _detail_frames_for_scene(scene, detail_frame_limit)
     prompt = f"""
 你是电影场景分析助手。请根据字幕、九宫格概览图和高清关键帧输出严格 JSON。
-字段：scene_id,start,end,location,characters,keyframe_times,grid_frame_times,frame_observations,visual_summary,dialogue_summary,evidence_quotes,events,emotion,importance,clip_value,anchor_start,anchor_end,transition_hint。
+字段：scene_id,start,end,location,characters,keyframe_times,grid_frame_times,frame_observations,visual_summary,dialogue_summary,evidence_quotes,events,emotion,importance,clip_value,visual_function,shot_type,motion_level,face_visible,visual_quality,brightness,subtitle_safe_area,best_use,bad_clip_reason,anchor_start,anchor_end,transition_hint。
 只能基于输入，不要编造。
 输入图片说明：
 - 如果存在 overview_grid，第一张图片是按时间顺序排列的九宫格概览图，每格左下角有编号和秒数。
@@ -72,6 +81,14 @@ events 只写这个时间段内确实发生的动作/信息变化。
 anchor_start/anchor_end 请选择本场景最适合剪进解说视频的 6-18 秒证据片段，必须在 start/end 内。
 transition_hint 写这一段和前后剧情的自然衔接关系。
 importance 取 0 到 1，clip_value 只能为 low/medium/high。
+visual_function 只能从 人物特写/环境空镜/动作镜头/反应镜头/证据镜头/象征镜头/对白镜头/转场镜头/坏镜头 中选择。
+shot_type 只能从 close_up/medium/wide/insert/unknown 中选择。
+motion_level 和 visual_quality 取 0 到 1。
+face_visible 为布尔值，表示主体人物脸部是否清晰可见。
+brightness 只能从 dark/normal/bright 中选择。
+subtitle_safe_area 只能从 bottom_safe/top_safe/unsafe/unknown 中选择，判断字幕是否适合放在底部或顶部。
+best_use 只能从 hook/setup/build/conflict/climax/reflection/support/avoid 中选择。
+bad_clip_reason 如果是黑屏、片头、演职员表、水印广告、低清晰度、字幕遮挡严重等不可用镜头，请写明原因；否则为空字符串。
 
 scene_id:{scene.scene_id}
 start:{scene.start}
@@ -118,6 +135,17 @@ def _coerce_scene_summary(item: Any, scene: Scene, detail_times: list[float] | N
     data['importance'] = min(1.0, max(0.0, float(data.get('importance') or 0.5)))
     clip_value = str(data.get('clip_value') or 'medium').strip().lower()
     data['clip_value'] = clip_value if clip_value in {'low', 'medium', 'high'} else 'medium'
+    data['visual_function'] = _coerce_choice(data.get('visual_function'), {
+        '人物特写', '环境空镜', '动作镜头', '反应镜头', '证据镜头', '象征镜头', '对白镜头', '转场镜头', '坏镜头',
+    }, '转场镜头')
+    data['shot_type'] = _coerce_choice(data.get('shot_type'), {'close_up', 'medium', 'wide', 'insert', 'unknown'}, 'unknown')
+    data['motion_level'] = _coerce_unit_float(data.get('motion_level'), 0.5)
+    data['face_visible'] = _coerce_bool(data.get('face_visible'), False)
+    data['visual_quality'] = _coerce_unit_float(data.get('visual_quality'), 0.5)
+    data['brightness'] = _coerce_choice(data.get('brightness'), {'dark', 'normal', 'bright'}, 'normal')
+    data['subtitle_safe_area'] = _coerce_choice(data.get('subtitle_safe_area'), {'bottom_safe', 'top_safe', 'unsafe', 'unknown'}, 'unknown')
+    data['best_use'] = _coerce_choice(data.get('best_use'), {'hook', 'setup', 'build', 'conflict', 'climax', 'reflection', 'support', 'avoid'}, 'support')
+    data['bad_clip_reason'] = str(data.get('bad_clip_reason') or '').strip()
     data['anchor_start'] = _coerce_anchor(data.get('anchor_start'), scene.start, scene.end, scene.start)
     data['anchor_end'] = _coerce_anchor(data.get('anchor_end'), scene.start, scene.end, min(scene.end, data['anchor_start'] + 12.0))
     if data['anchor_end'] <= data['anchor_start']:
@@ -145,6 +173,15 @@ def _fallback_scene_summary(scene: Scene, detail_times: list[float] | None = Non
         'emotion': 'unknown',
         'importance': 0.5,
         'clip_value': 'medium',
+        'visual_function': '转场镜头',
+        'shot_type': 'unknown',
+        'motion_level': 0.3,
+        'face_visible': False,
+        'visual_quality': 0.45,
+        'brightness': 'normal',
+        'subtitle_safe_area': 'unknown',
+        'best_use': 'support',
+        'bad_clip_reason': '',
         'anchor_start': scene.start,
         'anchor_end': min(scene.end, scene.start + 12.0),
         'transition_hint': '',
@@ -205,6 +242,31 @@ def _coerce_float_list(value: Any) -> list[float]:
         except (TypeError, ValueError):
             continue
     return result
+
+
+def _coerce_choice(value: Any, allowed: set[str], fallback: str) -> str:
+    text = str(value or '').strip()
+    return text if text in allowed else fallback
+
+
+def _coerce_unit_float(value: Any, fallback: float) -> float:
+    try:
+        return min(1.0, max(0.0, float(value)))
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _coerce_bool(value: Any, fallback: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value or '').strip().lower()
+    if text in {'true', 'yes', '1', '是', '有'}:
+        return True
+    if text in {'false', 'no', '0', '否', '无'}:
+        return False
+    return fallback
 
 
 def _coerce_anchor(value: Any, start: float, end: float, fallback: float) -> float:

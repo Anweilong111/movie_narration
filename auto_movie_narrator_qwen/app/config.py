@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     default_male_voice: str = 'Ethan'
     default_female_voice: str = 'Cherry'
     scene_detector: str = 'transnetv2'
+    scene_detector_allow_fallback: bool = False
     transnetv2_command: str = 'transnetv2_predict'
     transnetv2_min_shot_seconds: float = 0.75
     transnetv2_target_scene_seconds: float = 24.0
@@ -60,6 +61,7 @@ class Settings(BaseSettings):
     story_concurrency: int = 1
 
     quality_first_enabled: bool = False
+    legacy_workflow_enabled: bool = False
     turbo40_enabled: bool = False
     keyframe_extraction_mode: str = 'fps'
     tts_concurrency: int = 1
@@ -67,6 +69,14 @@ class Settings(BaseSettings):
     narrative_force_model_script: bool = False
     narrative_theme_rewrite_enabled: bool = True
     narrative_preserve_model_order: bool = True
+    narrative_duration_budget_enabled: bool = True
+    narrative_target_chars_per_second: float = 4.35
+    narrative_horror_chars_per_second: float = 3.95
+    narrative_action_chars_per_second: float = 4.75
+    narrative_comedy_chars_per_second: float = 5.0
+    narrative_duration_budget_hard_multiplier: float = 1.08
+    narrative_segment_min_chars: int = 42
+    narrative_segment_max_chars: int = 118
     clip_fragmentation_enabled: bool = True
     clip_fragment_min_seconds: float = 2.0
     clip_fragment_max_seconds: float = 5.0
@@ -77,8 +87,30 @@ class Settings(BaseSettings):
     clip_rhythm_min_visual_clip_seconds: float = 1.6
     clip_opening_hook_enabled: bool = True
     clip_opening_hook_seconds: float = 3.6
+    clip_story_first_enabled: bool = True
+    clip_story_window_padding_seconds: float = 90.0
+    clip_story_max_adjacent_backstep_seconds: float = 2.0
+    clip_story_boundary_guard_seconds: float = 0.4
+    clip_recommended_sync_enabled: bool = True
+    clip_max_recommended_source_drift_seconds: float = 24.0
+    clip_min_selected_score: float = 0.05
+    clip_min_source_window_seconds: float = 3.5
+    clip_fallback_min_seconds: float = 4.0
+    clip_max_repair_segments: int = 18
+    climax_pause_after_min_seconds: float = 0.55
+    reflection_pause_after_min_seconds: float = 0.7
+    workflow_guardrails_enabled: bool = True
+    workflow_guardrails_fail_on_error: bool = True
+    workflow_tail_guard_fraction: float = 0.04
+    workflow_tail_allowed_final_segments: int = 2
+    workflow_render_duration_tolerance_seconds: float = 8.0
+    douyin_strategy_enabled: bool = True
+    viral_quality_enabled: bool = True
+    douyin_packager_enabled: bool = True
     final_speedfit_enabled: bool = False
     final_speedfit_tolerance_seconds: float = 2.0
+    final_speedfit_max_ratio: float = 1.12
+    final_speedfit_allow_large_adjustment: bool = False
     final_vertical_enabled: bool = True
     final_vertical_width: int = 1080
     final_vertical_height: int = 1920
@@ -104,6 +136,7 @@ class Settings(BaseSettings):
     quality_freeze_detect_enabled: bool = True
     quality_freeze_detect_min_seconds: float = 4.5
     quality_freeze_detect_sample_fps: float = 2.0
+    quality_voice_speedfit_warn_threshold: float = 0.18
 
     @property
     def workdir(self) -> Path:

@@ -81,6 +81,8 @@ def test_run_llm_quality_check_uses_scene_grid_images(monkeypatch, tmp_path: Pat
 
     assert captured['image_paths'] == [str(grid)]
     assert '九宫格画面证据' in captured['prompt']
+    assert 'source_clip_windows' in captured['prompt']
+    assert '同一个 segment 可以被拆成多个短镜头' in captured['prompt']
     assert report['overall_score'] == 0.88
     assert report['checked_images'][0]['scene_id'] == 1
     assert (tmp_path / 'llm_quality_report.json').exists()

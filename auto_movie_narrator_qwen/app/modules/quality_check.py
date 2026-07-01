@@ -15,7 +15,7 @@ def run_quality_check(final_video: str, script: list[NarrationSegment], story_ev
                 issues.append(QualityIssue(type='script_consistency', severity='medium', segment_id=seg.segment_id, message=f'缺少事件证据：{eid}'))
         if not seg.audio_path:
             issues.append(QualityIssue(type='voice', severity='high', segment_id=seg.segment_id, message='该段没有配音'))
-        if not seg.evidence_quotes:
+        if not seg.evidence_quotes and not _allows_visual_only_evidence(seg):
             issues.append(QualityIssue(type='subtitle_evidence', severity='medium', segment_id=seg.segment_id, message='该段缺少字幕证据'))
         if not seg.visual_evidence:
             issues.append(QualityIssue(type='visual_evidence', severity='medium', segment_id=seg.segment_id, message='该段缺少画面证据'))
@@ -39,10 +39,11 @@ def run_quality_check(final_video: str, script: list[NarrationSegment], story_ev
         issues.append(QualityIssue(type='script_style', severity='low', message='连续段落开头结构过于相似，观感可能偏模板化'))
 
     speedfit_risk = _speedfit_adjustment_risk(script, target_duration)
-    if speedfit_risk > 0.08:
+    speedfit_threshold = max(0.0, float(get_settings().quality_voice_speedfit_warn_threshold or 0.08))
+    if speedfit_risk > speedfit_threshold:
         issues.append(QualityIssue(type='voice_pacing', severity='medium', message=f'TTS 总时长与目标差距 {speedfit_risk:.1%}，可能需要明显变速'))
 
-    starts = [seg.recommended_clip_start for seg in script]
+    starts = _story_order_starts_for_quality(script)
     if any(cur < prev for prev, cur in zip(starts, starts[1:])):
         issues.append(QualityIssue(type='timeline', severity='high', message='解说段落推荐时间戳不是按剧情时间顺序排列'))
 
@@ -148,8 +149,17 @@ def _overused_clauses(texts: list[str]) -> list[tuple[str, int]]:
 def _is_scene_supplement_event(event_id: str, segment: NarrationSegment) -> bool:
     return (
         str(event_id).startswith('S')
-        and bool(segment.evidence_quotes)
-        and bool(segment.visual_evidence)
+        and (bool(segment.evidence_quotes) or bool(segment.visual_evidence))
+    )
+
+
+def _allows_visual_only_evidence(segment: NarrationSegment) -> bool:
+    """Scene supplements can be silent visual beats; do not invent subtitle evidence."""
+    source_ids = [str(item) for item in segment.source_event_ids]
+    return (
+        bool(segment.visual_evidence)
+        and bool(source_ids)
+        and all(item.startswith('S') for item in source_ids)
     )
 
 
@@ -202,3 +212,19 @@ def _speedfit_adjustment_risk(script: list[NarrationSegment], target_duration: i
     if audio_end <= 0:
         return 0.0
     return abs(audio_end - float(target_duration)) / max(float(target_duration), 1.0)
+
+
+def _story_order_starts_for_quality(script: list[NarrationSegment]) -> list[float]:
+    if len(script) > 1 and _is_opening_hook_segment(script[0]):
+        return [float(seg.recommended_clip_start) for seg in script[1:]]
+    return [float(seg.recommended_clip_start) for seg in script]
+
+
+def _is_opening_hook_segment(seg: NarrationSegment) -> bool:
+    text = ' '.join([
+        str(seg.visual_intent or ''),
+        str(seg.preferred_visual_function or ''),
+        str(seg.voiceover or ''),
+    ]).lower()
+    hook_terms = ('hook', '开头钩子', '强钩子', '悬念', '荒野', '最后一场审判')
+    return any(term in text for term in hook_terms)

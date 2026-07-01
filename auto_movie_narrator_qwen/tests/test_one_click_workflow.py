@@ -97,6 +97,8 @@ def test_one_click_mock_pipeline_handles_no_audio_video(monkeypatch, capsys):
     assert output['artifacts']['duration_plan'] == str(task_dir / 'analysis' / 'duration_plan.json')
     assert output['artifacts']['director_plan'] == str(task_dir / 'analysis' / 'director_plan.json')
     assert output['artifacts']['shot_bank'] == str(task_dir / 'analysis' / 'shot_bank.json')
+    assert output['artifacts']['humanlike_visual_quality'] == str(task_dir / 'review' / 'humanlike_visual_quality.json')
+    assert output['artifacts']['clip_reedit_report'] == str(task_dir / 'edit' / 'clip_reedit_report.json')
     assert manifest_path.exists()
     manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
     assert manifest['task']['status'] == 'pending_review'
@@ -111,10 +113,14 @@ def test_one_click_mock_pipeline_handles_no_audio_video(monkeypatch, capsys):
     assert manifest['artifacts']['duration_plan']['exists'] is True
     assert manifest['artifacts']['director_plan']['exists'] is True
     assert manifest['artifacts']['shot_bank']['exists'] is True
+    assert manifest['artifacts']['humanlike_visual_quality']['exists'] is True
+    assert manifest['artifacts']['clip_reedit_report']['exists'] is True
     assert (task_dir / 'analysis' / 'style_profile.json').exists()
     assert (task_dir / 'analysis' / 'duration_plan.json').exists()
     assert (task_dir / 'analysis' / 'director_plan.json').exists()
     assert (task_dir / 'analysis' / 'shot_bank.json').exists()
+    assert (task_dir / 'review' / 'humanlike_visual_quality.json').exists()
+    assert (task_dir / 'edit' / 'clip_reedit_report.json').exists()
     assert json.loads((task_dir / 'asr' / 'transcript.json').read_text(encoding='utf-8'))[0]['text'] == '测试字幕第一句'
     assert (task_dir / 'review' / 'quality_report.json').exists()
     assert (task_dir / 'review' / 'llm_quality_report.json').exists()

@@ -35,6 +35,16 @@ def test_shot_bank_classifies_scenes_for_human_like_editing(tmp_path):
             importance=0.6,
             clip_value='medium',
         ),
+        SceneSummary(
+            scene_id=4,
+            start=32,
+            end=36,
+            visual_summary='片头黑底白字和平台水印',
+            importance=0.1,
+            clip_value='low',
+            visual_quality=0.2,
+            bad_clip_reason='片头字幕',
+        ),
     ]
 
     output = tmp_path / 'shot_bank.json'
@@ -44,5 +54,7 @@ def test_shot_bank_classifies_scenes_for_human_like_editing(tmp_path):
     assert bank['emotion_clips'][0]['visual_function'] == '人物特写'
     assert any(item['visual_function'] == '反应镜头' for item in bank['conflict_clips'])
     assert any(item['visual_function'] == '环境空镜' for item in bank['ending_clips'])
+    assert bank['face_clips'][0]['visual_function'] == '人物特写'
+    assert bank['bad_clips'][0]['scene_id'] == 4
     assert bank['emotion_clips'][0]['start'] == 1.0
     assert bank['emotion_clips'][0]['end'] == 7.0

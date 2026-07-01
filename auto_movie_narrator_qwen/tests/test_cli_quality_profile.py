@@ -48,6 +48,7 @@ def test_quality_first_profile_prioritizes_originality_over_runtime(monkeypatch)
             turbo40=True,
             fast_quality=False,
             quality_first=True,
+            legacy_workflow=False,
             fast_scene_target=None,
             fast_grid_frames=None,
             fast_detail_frames=None,
@@ -99,3 +100,55 @@ def test_target_duration_parser_accepts_auto_zero_and_seconds():
         _parse_target_duration('-1')
     with pytest.raises(argparse.ArgumentTypeError):
         _parse_target_duration('five minutes')
+
+
+def test_legacy_workflow_profile_disables_new_story_replanner(monkeypatch):
+    env_names = (
+        'LEGACY_WORKFLOW_ENABLED',
+        'CLIP_STORY_FIRST_ENABLED',
+        'NARRATIVE_DURATION_BUDGET_ENABLED',
+        'CLIP_OPENING_HOOK_ENABLED',
+    )
+    original_env = {name: os.environ.get(name) for name in env_names}
+    for name in env_names:
+        monkeypatch.delenv(name, raising=False)
+
+    try:
+        args = argparse.Namespace(
+            workdir=None,
+            mock=True,
+            real=False,
+            turbo40=False,
+            fast_quality=False,
+            quality_first=False,
+            legacy_workflow=True,
+            fast_scene_target=None,
+            fast_grid_frames=None,
+            fast_detail_frames=None,
+            vision_concurrency=None,
+            story_concurrency=None,
+            tts_concurrency=None,
+            keyframe_mode=None,
+            ffmpeg_video_encoder=None,
+            llm_quality_mode=None,
+            audio_background_volume=None,
+            audio_dialogue_volume=None,
+            audio_narration_volume=None,
+            final_speedfit=False,
+        )
+
+        _apply_env(args)
+        get_settings.cache_clear()
+        settings = get_settings()
+
+        assert settings.legacy_workflow_enabled is True
+        assert settings.clip_story_first_enabled is False
+        assert settings.narrative_duration_budget_enabled is False
+        assert settings.clip_opening_hook_enabled is True
+    finally:
+        for name, value in original_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        get_settings.cache_clear()

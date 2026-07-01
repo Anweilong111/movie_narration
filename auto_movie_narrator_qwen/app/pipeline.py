@@ -21,10 +21,21 @@ from app.modules.vision_analyzer import analyze_scenes
 from app.modules.story_builder import build_story_events, build_storyline
 from app.modules.duration_planner import explicit_duration_plan, plan_target_duration
 from app.modules.director_planner import build_director_plan
+from app.modules.douyin_strategy_planner import build_douyin_strategy
+from app.modules.story_timeline import build_story_timeline, bind_script_to_story_timeline
 from app.modules.shot_bank import build_shot_bank
 from app.modules.script_writer import generate_narration_script
 from app.modules.style_selector import resolve_narration_style
 from app.modules.renderer import compose_final, cut_and_concat, generate_clip_plan, generate_tts_and_subtitles
+from app.modules.clip_planner import generate_humanlike_clip_plan, repair_low_score_clip_plan
+from app.modules.humanlike_visual_quality import run_humanlike_visual_quality_check
+from app.modules.viral_quality_check import run_viral_quality_check
+from app.modules.douyin_packager import build_douyin_publish_package
+from app.modules.workflow_guardrails import (
+    repair_script_story_order,
+    validate_and_repair_clip_plan,
+    validate_render_timeline,
+)
 from app.modules.quality_check import run_quality_check
 from app.modules.llm_quality_check import run_llm_quality_check
 from app.modules.manifest import build_task_manifest
@@ -44,7 +55,7 @@ class MovieNarrationPipeline:
 
             self.storage.update_status(task_id, TaskStatus.preprocessing, 0.08, 'preprocessing')
             ffprobe_info(video_path, str(task_dir / 'preprocess' / 'video_info.json'))
-            audio = extract_audio(video_path, str(task_dir / 'preprocess' / 'audio.wav'))
+            audio = extract_audio(video_path, str(task_dir / 'preprocess' / 'audio.mp3'))
 
             if self.settings.turbo40_enabled:
                 self.storage.update_status(task_id, TaskStatus.transcribing, 0.18, 'transcribing_and_scene_detecting')
@@ -65,6 +76,7 @@ class MovieNarrationPipeline:
                         self.settings.transnetv2_min_shot_seconds,
                         self.settings.transnetv2_target_scene_seconds,
                         self.settings.transnetv2_max_scene_seconds,
+                        self.settings.scene_detector_allow_fallback,
                     )
                     transcript = transcript_future.result()
                     scenes = scenes_future.result()
@@ -82,6 +94,7 @@ class MovieNarrationPipeline:
                     transnetv2_min_shot_seconds=self.settings.transnetv2_min_shot_seconds,
                     transnetv2_target_scene_seconds=self.settings.transnetv2_target_scene_seconds,
                     transnetv2_max_scene_seconds=self.settings.transnetv2_max_scene_seconds,
+                    allow_fallback=self.settings.scene_detector_allow_fallback,
                 )
 
             source_scene_count = len(scenes)
@@ -221,6 +234,32 @@ class MovieNarrationPipeline:
                 task.target_duration,
                 task_dir / 'analysis' / 'director_plan.json',
             )
+            if self.settings.douyin_strategy_enabled:
+                douyin_strategy = build_douyin_strategy(
+                    storyline,
+                    story_events,
+                    scene_summaries,
+                    director_plan,
+                    task.target_duration,
+                    task_dir / 'analysis' / 'douyin_strategy.json',
+                )
+            else:
+                douyin_strategy = {'enabled': False}
+                save_json(task_dir / 'analysis' / 'douyin_strategy.json', douyin_strategy)
+            if self.settings.legacy_workflow_enabled:
+                story_timeline = {}
+                save_json(task_dir / 'analysis' / 'story_timeline.json', {
+                    'enabled': False,
+                    'legacy_workflow_enabled': True,
+                    'reason': 'legacy workflow skips story timeline binding',
+                })
+            else:
+                story_timeline = build_story_timeline(
+                    story_events,
+                    director_plan,
+                    task_dir / 'analysis' / 'story_timeline.json',
+                    source_duration,
+                )
 
             self.storage.update_status(task_id, TaskStatus.script_generating, 0.64, 'script_generating')
             script = generate_narration_script(
@@ -232,14 +271,114 @@ class MovieNarrationPipeline:
                 scene_summaries,
                 director_plan,
             )
+            if not self.settings.legacy_workflow_enabled:
+                story_timeline = bind_script_to_story_timeline(
+                    script,
+                    story_events,
+                    story_timeline,
+                    task_dir / 'analysis' / 'story_timeline.json',
+                    source_duration,
+                )
+                script = repair_script_story_order(
+                    script,
+                    story_timeline,
+                    task_dir / 'script' / 'narration_script.json',
+                    task_dir / 'review' / 'script_story_guardrails.json',
+                )
+                story_timeline = bind_script_to_story_timeline(
+                    script,
+                    story_events,
+                    story_timeline,
+                    task_dir / 'analysis' / 'story_timeline.json',
+                    source_duration,
+                )
 
             self.storage.update_status(task_id, TaskStatus.voice_generating, 0.74, 'voice_generating')
             voice = self.storage.get_voice(task.voice_profile_id)
             script = generate_tts_and_subtitles(task_dir, script, voice, task.style)
 
             self.storage.update_status(task_id, TaskStatus.editing, 0.84, 'editing')
-            plan = generate_clip_plan(script, str(task_dir / 'edit' / 'clip_plan.json'), ffprobe_duration(video_path))
+            source_duration_for_edit = ffprobe_duration(video_path)
+            if self.settings.legacy_workflow_enabled:
+                plan = generate_clip_plan(
+                    script,
+                    str(task_dir / 'edit' / 'clip_plan.json'),
+                    source_duration_for_edit,
+                )
+                save_json(task_dir / 'edit' / 'clip_planner_report.json', {
+                    'planner': 'legacy_renderer',
+                    'legacy_workflow_enabled': True,
+                    'clip_count': len(plan),
+                })
+                save_json(task_dir / 'edit' / 'clip_reedit_report.json', {
+                    'enabled': False,
+                    'reason': 'legacy_workflow_enabled',
+                })
+                save_json(task_dir / 'review' / 'humanlike_visual_quality.json', {
+                    'ok': True,
+                    'reviewer': 'legacy_workflow_skipped',
+                    'legacy_workflow_enabled': True,
+                    'human_like_score': None,
+                    'issues': [],
+                })
+            else:
+                plan = generate_humanlike_clip_plan(
+                    script,
+                    str(task_dir / 'edit' / 'clip_plan.json'),
+                    source_duration_for_edit,
+                    task_dir / 'analysis' / 'shot_bank.json',
+                    director_plan=director_plan,
+                    story_timeline=story_timeline,
+                )
+                run_humanlike_visual_quality_check(
+                    script,
+                    plan,
+                    task_dir / 'analysis' / 'shot_bank.json',
+                    task_dir / 'edit' / 'clip_planner_report.json',
+                    task_dir / 'review' / 'humanlike_visual_quality.json',
+                    task_dir / 'analysis' / 'story_timeline.json',
+                )
+                plan = repair_low_score_clip_plan(
+                    script,
+                    str(task_dir / 'edit' / 'clip_plan.json'),
+                    source_duration_for_edit,
+                    task_dir / 'analysis' / 'shot_bank.json',
+                    task_dir / 'review' / 'humanlike_visual_quality.json',
+                    director_plan=director_plan,
+                    story_timeline=story_timeline,
+                )
+                run_humanlike_visual_quality_check(
+                    script,
+                    plan,
+                    task_dir / 'analysis' / 'shot_bank.json',
+                    task_dir / 'edit' / 'clip_planner_report.json',
+                    task_dir / 'review' / 'humanlike_visual_quality.json',
+                    task_dir / 'analysis' / 'story_timeline.json',
+                )
+            plan = validate_and_repair_clip_plan(
+                script,
+                plan,
+                task_dir / 'analysis' / 'story_timeline.json',
+                source_duration_for_edit,
+                task_dir / 'analysis' / 'shot_bank.json',
+                task_dir / 'edit' / 'clip_plan.json',
+                task_dir / 'review' / 'clip_plan_guardrails.json',
+            )
+            voice_full_audio = task_dir / 'tts' / 'voice_full.wav'
+            validate_render_timeline(
+                script,
+                plan,
+                voice_full_audio,
+                report_json=task_dir / 'review' / 'render_timeline_guardrails.before_cut.json',
+            )
             cut_and_concat(task_dir, video_path, plan, video_encoder=self.settings.ffmpeg_video_encoder)
+            validate_render_timeline(
+                script,
+                plan,
+                voice_full_audio,
+                task_dir / 'edit' / 'cut_video.mp4',
+                report_json=task_dir / 'review' / 'render_timeline_guardrails.after_cut.json',
+            )
 
             self.storage.update_status(task_id, TaskStatus.rendering, 0.92, 'rendering')
             dialogue_intervals = []
@@ -261,13 +400,56 @@ class MovieNarrationPipeline:
                 narration_volume=self.settings.audio_narration_volume,
                 video_encoder=self.settings.ffmpeg_video_encoder,
             )
+            validate_render_timeline(
+                script,
+                plan,
+                voice_full_audio,
+                task_dir / 'edit' / 'cut_video.mp4',
+                final_video,
+                task_dir / 'review' / 'render_timeline_guardrails.final.json',
+            )
             if self.settings.final_speedfit_enabled:
-                final_video = speedfit_video(
-                    final_video,
-                    task.target_duration,
-                    video_encoder=self.settings.ffmpeg_video_encoder,
-                    tolerance_seconds=self.settings.final_speedfit_tolerance_seconds,
+                speedfit_report_path = task_dir / 'render' / 'final_speedfit_report.json'
+                before_speedfit_duration = ffprobe_duration(final_video)
+                target_duration = float(task.target_duration or 0)
+                speedfit_ratio = before_speedfit_duration / target_duration if target_duration > 0 else 1.0
+                max_ratio = max(1.0, float(self.settings.final_speedfit_max_ratio or 1.0))
+                ratio_allowed = (
+                    target_duration > 0
+                    and (
+                        self.settings.final_speedfit_allow_large_adjustment
+                        or (1.0 / max_ratio) <= speedfit_ratio <= max_ratio
+                    )
                 )
+                if ratio_allowed:
+                    final_video = speedfit_video(
+                        final_video,
+                        task.target_duration,
+                        video_encoder=self.settings.ffmpeg_video_encoder,
+                        tolerance_seconds=self.settings.final_speedfit_tolerance_seconds,
+                    )
+                    after_speedfit_duration = ffprobe_duration(final_video)
+                    save_json(speedfit_report_path, {
+                        'enabled': True,
+                        'applied': abs(before_speedfit_duration - target_duration) > self.settings.final_speedfit_tolerance_seconds,
+                        'before_duration': before_speedfit_duration,
+                        'after_duration': after_speedfit_duration,
+                        'target_duration': target_duration,
+                        'ratio': speedfit_ratio,
+                        'max_ratio': max_ratio,
+                        'reason': 'within_speedfit_ratio_limit',
+                    })
+                else:
+                    save_json(speedfit_report_path, {
+                        'enabled': True,
+                        'applied': False,
+                        'before_duration': before_speedfit_duration,
+                        'after_duration': before_speedfit_duration,
+                        'target_duration': target_duration,
+                        'ratio': speedfit_ratio,
+                        'max_ratio': max_ratio,
+                        'reason': 'ratio_exceeds_limit_or_invalid_target',
+                    })
 
             self.storage.update_status(task_id, TaskStatus.quality_checking, 0.96, 'quality_checking')
             quality_report = run_quality_check(final_video, script, story_events, str(task_dir / 'review' / 'quality_report.json'), task.target_duration)
@@ -302,6 +484,35 @@ class MovieNarrationPipeline:
                     task.target_duration,
                     quality_report,
                 )
+            if self.settings.viral_quality_enabled:
+                viral_report = run_viral_quality_check(
+                    final_video,
+                    script,
+                    story_events,
+                    plan,
+                    task_dir / 'analysis' / 'shot_bank.json',
+                    task_dir / 'review' / 'viral_quality_report.json',
+                    task.target_duration,
+                    douyin_strategy,
+                )
+            else:
+                viral_report = {'enabled': False}
+                save_json(task_dir / 'review' / 'viral_quality_report.json', viral_report)
+
+            if self.settings.douyin_packager_enabled:
+                build_douyin_publish_package(
+                    task_dir,
+                    task.original_video_path,
+                    storyline,
+                    story_events,
+                    director_plan,
+                    style_profile,
+                    script,
+                    viral_report,
+                    douyin_strategy,
+                )
+            else:
+                save_json(task_dir / 'publish' / 'douyin_package.json', {'enabled': False})
 
             task = self.storage.get_task(task_id)
             task.final_video_path = final_video

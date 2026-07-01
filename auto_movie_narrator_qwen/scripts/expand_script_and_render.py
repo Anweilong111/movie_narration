@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -25,10 +26,13 @@ from app.config import get_settings
 from app.models import NarrationSegment, SceneSummary, StoryEvent, TaskStatus, TranscriptSegment
 from app.modules.fast_quality import dialogue_intervals_for_clip_plan
 from app.modules.ffmpeg_tools import ffprobe_duration, speedfit_video
+from app.modules.clip_planner import generate_humanlike_clip_plan, repair_low_score_clip_plan
+from app.modules.humanlike_visual_quality import run_humanlike_visual_quality_check
 from app.modules.llm_quality_check import run_llm_quality_check
 from app.modules.manifest import build_task_manifest
 from app.modules.quality_check import run_quality_check
-from app.modules.renderer import compose_final, cut_and_concat, generate_clip_plan, generate_tts_and_subtitles
+from app.modules.renderer import compose_final, cut_and_concat, generate_tts_and_subtitles
+from app.modules.story_timeline import build_story_timeline, bind_script_to_story_timeline
 from app.providers.qwen_llm import QwenLLMClient
 from app.storage import LocalStorage
 from app.utils.json_utils import extract_json, load_json, save_json
@@ -73,6 +77,7 @@ def main(argv: list[str]) -> int:
         expanded_items = load_json(source_path, [])
     else:
         base_items = load_json(base_path, [])
+        target_chars = _target_chars(task.target_duration, base_items, task_dir)
         expanded_items = expand_script(
             base_items,
             story_events,
@@ -81,6 +86,7 @@ def main(argv: list[str]) -> int:
             task.target_duration,
             task.style,
             task_dir,
+            target_chars,
         )
         save_json(script_path, expanded_items)
         save_json(task_dir / 'script' / 'expansion_report.json', {
@@ -88,7 +94,7 @@ def main(argv: list[str]) -> int:
             'segments': len(expanded_items),
             'total_chars': sum(len(str(item.get('voiceover') or '')) for item in expanded_items),
             'target_duration_seconds': task.target_duration,
-            'target_chars': _target_chars(task.target_duration),
+            'target_chars': target_chars,
         })
 
     split_chunks = os.environ.get('EXPAND_SCRIPT_SPLIT_CHUNKS', 'false').strip().lower() in {'1', 'true', 'yes', 'on'}
@@ -106,6 +112,18 @@ def main(argv: list[str]) -> int:
 
     _clear_downstream_artifacts(task_dir, keep_segment_audio=skip_expand and not split_chunks)
     script = [NarrationSegment(**item) for item in expanded_items]
+    source_duration = ffprobe_duration(task.original_video_path)
+    story_timeline_path = task_dir / 'analysis' / 'story_timeline.json'
+    story_timeline = load_json(story_timeline_path, {})
+    if not story_timeline:
+        story_timeline = build_story_timeline(story_events, director_plan, story_timeline_path, source_duration)
+    story_timeline = bind_script_to_story_timeline(
+        script,
+        story_events,
+        story_timeline,
+        story_timeline_path,
+        source_duration,
+    )
 
     storage.update_status(task.id, TaskStatus.voice_generating, 0.74, 'voice_generating')
     voice = storage.get_voice(task.voice_profile_id)
@@ -118,8 +136,39 @@ def main(argv: list[str]) -> int:
     })
 
     storage.update_status(task.id, TaskStatus.editing, 0.84, 'editing')
-    source_duration = ffprobe_duration(task.original_video_path)
-    plan = generate_clip_plan(script, str(task_dir / 'edit' / 'clip_plan.json'), source_duration)
+    plan = generate_humanlike_clip_plan(
+        script,
+        str(task_dir / 'edit' / 'clip_plan.json'),
+        source_duration,
+        task_dir / 'analysis' / 'shot_bank.json',
+        director_plan=director_plan,
+        story_timeline=story_timeline,
+    )
+    run_humanlike_visual_quality_check(
+        script,
+        plan,
+        task_dir / 'analysis' / 'shot_bank.json',
+        task_dir / 'edit' / 'clip_planner_report.json',
+        task_dir / 'review' / 'humanlike_visual_quality.json',
+        story_timeline_path,
+    )
+    plan = repair_low_score_clip_plan(
+        script,
+        str(task_dir / 'edit' / 'clip_plan.json'),
+        source_duration,
+        task_dir / 'analysis' / 'shot_bank.json',
+        task_dir / 'review' / 'humanlike_visual_quality.json',
+        director_plan=director_plan,
+        story_timeline=story_timeline,
+    )
+    run_humanlike_visual_quality_check(
+        script,
+        plan,
+        task_dir / 'analysis' / 'shot_bank.json',
+        task_dir / 'edit' / 'clip_planner_report.json',
+        task_dir / 'review' / 'humanlike_visual_quality.json',
+        story_timeline_path,
+    )
     cut_and_concat(task_dir, task.original_video_path, plan, video_encoder=settings.ffmpeg_video_encoder)
 
     storage.update_status(task.id, TaskStatus.rendering, 0.92, 'rendering')
@@ -199,13 +248,14 @@ def expand_script(
     target_duration: int,
     style: str,
     task_dir: Path,
+    target_chars: int | None = None,
 ) -> list[dict[str, Any]]:
     if not base_items:
         return []
-    target_chars = _target_chars(target_duration)
-    per_segment = max(260, math.ceil(target_chars / max(len(base_items), 1)))
-    min_chars = max(240, per_segment - 25)
-    max_chars = min(420, per_segment + 55)
+    target_chars = target_chars or _target_chars(target_duration, base_items, task_dir)
+    per_segment = max(42, math.ceil(target_chars / max(len(base_items), 1)))
+    min_chars = max(38, int(per_segment * 0.82))
+    max_chars = min(420, max(min_chars + 18, int(per_segment * 1.24)))
     event_map = {event.event_id: event for event in story_events}
     scene_notes = _compact_scene_notes(scene_summaries)
     client = QwenLLMClient()
@@ -252,8 +302,38 @@ def expand_script(
     return expanded
 
 
-def _target_chars(target_duration: int) -> int:
-    return max(12000, int(float(target_duration) * 14.0))
+def _target_chars(target_duration: int, base_items: list[dict[str, Any]] | None = None, task_dir: Path | None = None) -> int:
+    override = os.environ.get('EXPAND_SCRIPT_TARGET_CHARS')
+    if override:
+        return max(500, int(float(override)))
+
+    base_chars = sum(len(str(item.get('voiceover') or '')) for item in (base_items or []))
+    calibrated = _target_chars_from_existing_audio(target_duration, base_chars, task_dir)
+    if calibrated:
+        return calibrated
+    return max(1200, int(float(target_duration) * 5.2))
+
+
+def _target_chars_from_existing_audio(target_duration: int, base_chars: int, task_dir: Path | None) -> int | None:
+    if target_duration <= 0 or base_chars <= 0 or task_dir is None:
+        return None
+    candidates = [task_dir / 'tts' / 'voice_full.wav', task_dir / 'tts' / 'voice_full.aac']
+    source_duration = 0.0
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            source_duration = max(source_duration, ffprobe_duration(str(path)))
+        except Exception:
+            continue
+    if source_duration <= 30:
+        return None
+    chars_per_second = base_chars / source_duration
+    buffer = float(os.environ.get('EXPAND_SCRIPT_TARGET_CHAR_BUFFER', '1.04'))
+    target = int(float(target_duration) * chars_per_second * buffer)
+    lower = max(int(base_chars * 1.05), 1200)
+    upper = max(lower, int(base_chars * 1.65))
+    return min(max(target, lower), upper)
 
 
 def _build_expand_prompt(
@@ -310,7 +390,7 @@ def _compact_event(event: StoryEvent) -> dict[str, Any]:
         'cause': event.cause,
         'result': event.result,
         'evidence_quotes': event.evidence_quotes[:2],
-        'visual_evidence': event.visual_evidence[:2],
+        'visual_evidence': [cleaned for item in event.visual_evidence[:2] if (cleaned := _clean_visual_evidence(item))],
     }
 
 
@@ -338,21 +418,25 @@ def _local_expand_voiceover(
 ) -> str:
     text = _clean_voiceover(str(item.get('voiceover') or ''))
     events = [event_map[eid] for eid in item.get('source_event_ids', []) if eid in event_map]
-    theme = str(director_plan.get('movie_theme') or director_plan.get('core_conflict') or '贪婪把人推向不可回头的深渊')
+    theme = str(director_plan.get('movie_theme') or director_plan.get('core_conflict') or '人物在未知威胁面前被迫直面真相与代价')
     additions = []
     if events:
         event = events[0]
+        if event.event and event.event != 'unknown':
+            additions.append(f'{_short(event.event, 62)}，这一段要让观众知道危险已经从传闻落到现实。')
         if event.cause and event.cause != 'unknown':
-            additions.append(f'这一步不是突然失控，它的根子在于{_short(event.cause, 52)}。')
+            additions.append(f'它不是突然失控，前面的压力来自{_short(event.cause, 58)}。')
         if event.result and event.result != 'unknown':
-            additions.append(f'更可怕的是，结果并没有把人拉回理智，反而让{_short(event.result, 58)}。')
+            additions.append(f'这件事带来的后果是{_short(event.result, 62)}。')
         if event.evidence_quotes:
-            additions.append(f'对白里那句“{_short(event.evidence_quotes[0], 34)}”，听上去像解释，其实是在暴露他们已经开始替贪念找理由。')
+            additions.append(f'原片信息里那句“{_short(event.evidence_quotes[0], 34)}”，让怀疑不再只是传闻，而变成可以追查的线索。')
         if event.visual_evidence:
-            additions.append(f'{_short(event.visual_evidence[0], 48)}，把封闭车厢里的不安压得更低。')
+            visual = _clean_visual_evidence(event.visual_evidence[0])
+            if visual:
+                additions.append(f'{_short(visual, 58)}，把这一段的压迫感落到具体细节上。')
     additions.append(f'所以这一段真正讲的不是单个意外，而是{_short(theme, 70)}。')
-    additions.append('它让观众看到，封闭车厢并不只是空间限制，而是一种心理压力：每个人越想把事情藏起来，越会把自己推向更窄的出口。')
-    additions.append('这种处理也让恐怖感从外部威胁转向人物内部，因为真正让列车失控的，不只是未知力量，还有他们一次次主动放弃底线。')
+    additions.append('这里要留出一点停顿，让观众先听懂规则，再感到倒计时正在逼近。')
+    additions.append('恐怖感不能只靠惊吓，还要让每一次调查都变成新的压力。')
     idx = 0
     while len(text) < min_chars and idx < len(additions) * 4:
         text = text.rstrip('。') + '。' + additions[idx % len(additions)]
@@ -428,12 +512,23 @@ def _clean_voiceover(text: str) -> str:
     text = ' '.join(text.replace('\n', ' ').split())
     for phrase in FORBIDDEN_PHRASES:
         text = text.replace(phrase, '')
+    text = re.sub(r'表面上这是([^。！？!?]{2,90})，但它真正制造的是[^。！？!?]*[。！？!?]?', r'\1。', text)
+    text = re.sub(r'(?:^|[，,。；;！？!?])\s*\d{2,5}(?:\.\d+)?\s*s?[:：][^。！？!?；;]*[。！？!?；;]?', '。', text)
+    text = re.sub(r'(?<![A-Za-z0-9])\d{2,5}(?:\.\d+)?\s*s?[:：]\s*', '', text)
     text = text.replace('…。。', '。').replace('。。', '。')
     return text.strip(' ，,')
 
 
+def _clean_visual_evidence(text: str) -> str:
+    text = ' '.join(str(text or '').replace('\n', ' ').split())
+    text = re.sub(r'^\s*\d{2,5}(?:\.\d+)?\s*s?[:：]\s*', '', text)
+    text = re.sub(r'(?<![A-Za-z0-9])\d{2,5}(?:\.\d+)?\s*s?[:：]\s*', '', text)
+    text = text.replace('画面显示', '').replace('镜头显示', '').replace('字幕显示', '')
+    return text.strip('。 ，,;；')
+
+
 def _short(text: str, limit: int) -> str:
-    text = ' '.join(str(text).split()).strip('。 ，,')
+    text = _clean_voiceover(str(text)).strip('。 ，,')
     return text if len(text) <= limit else text[:limit - 1].rstrip('，,、；;：:') + '…'
 
 
@@ -451,8 +546,12 @@ def _trim_to_sentence(text: str, limit: int) -> str:
 def _clear_downstream_artifacts(task_dir: Path, keep_segment_audio: bool = False) -> None:
     patterns = [
         'tts/pause_*.wav',
+        'tts/voice_full.wav',
         'tts/voice_full.aac',
         'edit/clip_plan.json',
+        'edit/clip_planner_report.json',
+        'edit/clip_reedit_report.json',
+        'edit/clip_rhythm_report.json',
         'edit/cut_video.mp4',
         'edit/clips/*.mp4',
         'render/subtitle.srt',
@@ -462,6 +561,7 @@ def _clear_downstream_artifacts(task_dir: Path, keep_segment_audio: bool = False
         'render/final.speedfit.mp4',
         'review/quality_report.json',
         'review/llm_quality_report.json',
+        'review/humanlike_visual_quality.json',
         'manifest.json',
     ]
     if not keep_segment_audio:

@@ -4,8 +4,8 @@ import base64
 import mimetypes
 from pathlib import Path
 from typing import Any, Optional
-from openai import OpenAI
 from app.config import get_settings
+from app.providers.dashscope_auth import dashscope_api_key
 from app.utils.json_utils import extract_json
 
 
@@ -15,9 +15,12 @@ class QwenLLMClient:
         self.mock = self.settings.app_mock_mode
         self.client = None
         if not self.mock:
-            if not self.settings.dashscope_api_key:
-                raise RuntimeError('DASHSCOPE_API_KEY is required')
-            self.client = OpenAI(api_key=self.settings.dashscope_api_key, base_url=self.settings.dashscope_compat_base_url)
+            api_key = dashscope_api_key(self.settings)
+            try:
+                from openai import OpenAI
+            except ModuleNotFoundError as exc:
+                raise RuntimeError('openai package is required for real Qwen API mode; install requirements.txt') from exc
+            self.client = OpenAI(api_key=api_key, base_url=self.settings.dashscope_compat_base_url)
 
     def chat(self, prompt: str, model: Optional[str] = None, temperature: float = 0.2) -> str:
         if self.mock:

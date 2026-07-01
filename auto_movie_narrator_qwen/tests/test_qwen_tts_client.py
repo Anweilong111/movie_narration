@@ -91,6 +91,57 @@ def test_synthesize_saves_raw_response_and_audio(monkeypatch, tmp_path: Path):
     assert (tmp_path / 'voice.raw_response.json').exists()
 
 
+def test_synthesize_omits_instructions_for_plain_flash_model(monkeypatch, tmp_path: Path):
+    client = make_real_tts_client(monkeypatch)
+    audio = b'tts-audio'
+
+    def fake_post(url: str, **kwargs):
+        payload = kwargs['json']
+        assert payload['model'] == 'qwen3-tts-flash'
+        assert payload['input']['voice'] == 'Neil'
+        assert 'instructions' not in payload['input']
+        assert 'optimize_instructions' not in payload['input']
+        return FakeResponse({'output': {'audio': {'data': base64.b64encode(audio).decode('ascii')}}})
+
+    monkeypatch.setattr('app.providers.qwen_tts.requests.post', fake_post)
+
+    out = tmp_path / 'plain_flash.wav'
+    assert client.synthesize(
+        'hello',
+        'Neil',
+        str(out),
+        model='qwen3-tts-flash',
+        instructions='read dramatically',
+        optimize_instructions=True,
+    ) == str(out)
+    assert out.read_bytes() == audio
+
+
+def test_synthesize_keeps_instructions_for_instruct_flash_model(monkeypatch, tmp_path: Path):
+    client = make_real_tts_client(monkeypatch)
+    audio = b'tts-audio'
+
+    def fake_post(url: str, **kwargs):
+        payload = kwargs['json']
+        assert payload['model'] == 'qwen3-tts-instruct-flash'
+        assert payload['input']['instructions'] == 'read dramatically'
+        assert payload['input']['optimize_instructions'] is True
+        return FakeResponse({'output': {'audio': {'data': base64.b64encode(audio).decode('ascii')}}})
+
+    monkeypatch.setattr('app.providers.qwen_tts.requests.post', fake_post)
+
+    out = tmp_path / 'instruct_flash.wav'
+    assert client.synthesize(
+        'hello',
+        'Neil',
+        str(out),
+        model='qwen3-tts-instruct-flash',
+        instructions='read dramatically',
+        optimize_instructions=True,
+    ) == str(out)
+    assert out.read_bytes() == audio
+
+
 def test_synthesize_polls_async_task_until_audio(monkeypatch, tmp_path: Path):
     client = make_real_tts_client(monkeypatch)
     audio = b'async-audio'

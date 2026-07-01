@@ -10,6 +10,7 @@ import requests
 from app.config import get_settings
 from app.models import TranscriptSegment
 from app.modules.ffmpeg_tools import ffprobe_duration
+from app.providers.dashscope_auth import dashscope_api_key, dashscope_headers
 from app.utils.json_utils import load_json
 from app.utils.json_utils import save_json
 
@@ -58,8 +59,7 @@ class ASRProvider:
         return segments
 
     def _transcribe_with_dashscope(self, audio_path: str, output_json: str) -> list[TranscriptSegment]:
-        if not self.settings.dashscope_api_key:
-            raise RuntimeError('DASHSCOPE_API_KEY is required')
+        dashscope_api_key(self.settings)
         output_path = Path(output_json)
         raw_dir = output_path.parent / 'raw'
         raw_dir.mkdir(parents=True, exist_ok=True)
@@ -106,7 +106,7 @@ class ASRProvider:
     def _get_upload_policy(self) -> dict:
         resp = requests.get(
             f"{self.settings.dashscope_http_base_url.rstrip('/')}/uploads",
-            headers={'Authorization': f'Bearer {self.settings.dashscope_api_key}', 'Content-Type': 'application/json'},
+            headers=dashscope_headers(self.settings),
             params={'action': 'getPolicy', 'model': self.settings.qwen_asr_model},
             timeout=self.settings.qwen_request_timeout_seconds,
         )
@@ -211,12 +211,13 @@ class ASRProvider:
         return sorted(segments, key=lambda item: (item.start, item.end))
 
     def _asr_headers(self) -> dict[str, str]:
-        return {
-            'Authorization': f'Bearer {self.settings.dashscope_api_key}',
-            'Content-Type': 'application/json',
-            'X-DashScope-Async': 'enable',
-            'X-DashScope-OssResourceResolve': 'enable',
-        }
+        return dashscope_headers(
+            self.settings,
+            extra={
+                'X-DashScope-Async': 'enable',
+                'X-DashScope-OssResourceResolve': 'enable',
+            },
+        )
 
     @staticmethod
     def _find_task_id(data: dict) -> Optional[str]:

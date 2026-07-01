@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Optional
 import requests
 from app.config import get_settings
+from app.providers.dashscope_auth import dashscope_api_key, dashscope_headers
 
 
 class QwenTTSClient:
@@ -23,21 +24,21 @@ class QwenTTSClient:
         if self.mock:
             self._write_silent_wav(out)
             return str(out)
-        if not self.settings.dashscope_api_key:
-            raise RuntimeError('DASHSCOPE_API_KEY is required')
+        dashscope_api_key(self.settings)
 
         endpoint = f"{self.settings.dashscope_http_base_url.rstrip('/')}/services/aigc/multimodal-generation/generation"
+        selected_model = model or self.settings.qwen_tts_model
         payload: dict[str, Any] = {
-            'model': model or self.settings.qwen_tts_model,
+            'model': selected_model,
             'input': {'text': text, 'voice': voice, 'language_type': language_type},
         }
-        if instructions:
+        if instructions and _supports_instructions(selected_model):
             payload['input']['instructions'] = instructions
             payload['input']['optimize_instructions'] = optimize_instructions
 
         resp = requests.post(
             endpoint,
-            headers={'Authorization': f'Bearer {self.settings.dashscope_api_key}', 'Content-Type': 'application/json'},
+            headers=dashscope_headers(self.settings),
             json=payload,
             timeout=self.settings.qwen_request_timeout_seconds,
         )
@@ -158,7 +159,7 @@ class QwenTTSClient:
         endpoint = f"{self.settings.dashscope_http_base_url.rstrip('/')}/tasks/{task_id}"
         resp = requests.get(
             endpoint,
-            headers={'Authorization': f'Bearer {self.settings.dashscope_api_key}'},
+            headers=dashscope_headers(self.settings, content_type=False),
             timeout=self.settings.qwen_request_timeout_seconds,
         )
         resp.raise_for_status()
@@ -204,3 +205,7 @@ class QwenTTSClient:
             wf.setframerate(sample_rate)
             for _ in range(int(sample_rate * seconds)):
                 wf.writeframes(struct.pack('<h', 0))
+
+
+def _supports_instructions(model: str | None) -> bool:
+    return 'instruct' in str(model or '').lower()

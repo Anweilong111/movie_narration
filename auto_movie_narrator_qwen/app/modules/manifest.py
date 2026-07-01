@@ -19,38 +19,58 @@ ARTIFACTS = {
     'input_subtitle_srt': 'input/transcript.srt',
     'video_info': 'preprocess/video_info.json',
     'audio': 'preprocess/audio.wav',
+    'audio_mp3': 'preprocess/audio.mp3',
     'transcript': 'asr/transcript.json',
     'scenes': 'scenes/scenes.json',
     'scenes_enriched': 'scenes/scenes_enriched.json',
     'scene_summaries': 'analysis/scene_summaries.json',
     'story_events': 'analysis/story_events.json',
+    'story_timeline': 'analysis/story_timeline.json',
     'storyline': 'analysis/storyline.json',
     'style_profile': 'analysis/style_profile.json',
     'duration_plan': 'analysis/duration_plan.json',
     'director_plan': 'analysis/director_plan.json',
+    'douyin_strategy': 'analysis/douyin_strategy.json',
     'shot_bank': 'analysis/shot_bank.json',
     'script': 'script/narration_script.json',
     'script_with_audio': 'script/narration_with_audio.json',
+    'voice_full_wav': 'tts/voice_full.wav',
     'voice_full': 'tts/voice_full.aac',
+    'clip_planner_report': 'edit/clip_planner_report.json',
+    'clip_reedit_report': 'edit/clip_reedit_report.json',
     'clip_plan': 'edit/clip_plan.json',
     'cut_video': 'edit/cut_video.mp4',
     'subtitle': 'render/subtitle.srt',
     'final_video': 'render/final.mp4',
+    'movie_description': 'render/movie_description.txt',
+    'humanlike_visual_quality': 'review/humanlike_visual_quality.json',
+    'viral_quality_report': 'review/viral_quality_report.json',
     'quality_report': 'review/quality_report.json',
     'llm_quality_report': 'review/llm_quality_report.json',
+    'douyin_package': 'publish/douyin_package.json',
+    'douyin_titles': 'publish/title_candidates.txt',
+    'douyin_cover_text': 'publish/cover_text.txt',
+    'douyin_caption': 'publish/douyin_caption.txt',
+    'douyin_hashtags': 'publish/hashtags.txt',
+    'douyin_comment_hooks': 'publish/comment_hooks.txt',
 }
 
 
 def build_task_manifest(task_dir: Path, task: VideoTask, settings: Settings, output_path: Optional[Path] = None) -> dict[str, Any]:
     output_path = output_path or task_dir / 'manifest.json'
     quality_report = load_json(task_dir / 'review' / 'quality_report.json', {})
+    humanlike_visual_quality = load_json(task_dir / 'review' / 'humanlike_visual_quality.json', {})
     llm_quality_report = load_json(task_dir / 'review' / 'llm_quality_report.json', {})
     transcript = load_json(task_dir / 'asr' / 'transcript.json', [])
     scenes = load_json(task_dir / 'scenes' / 'scenes_enriched.json', [])
     story_events = load_json(task_dir / 'analysis' / 'story_events.json', [])
+    story_timeline = load_json(task_dir / 'analysis' / 'story_timeline.json', {})
     style_profile = load_json(task_dir / 'analysis' / 'style_profile.json', {})
     duration_plan = load_json(task_dir / 'analysis' / 'duration_plan.json', {})
     director_plan = load_json(task_dir / 'analysis' / 'director_plan.json', {})
+    douyin_strategy = load_json(task_dir / 'analysis' / 'douyin_strategy.json', {})
+    viral_quality_report = load_json(task_dir / 'review' / 'viral_quality_report.json', {})
+    douyin_package = load_json(task_dir / 'publish' / 'douyin_package.json', {})
     script = load_json(task_dir / 'script' / 'narration_with_audio.json', [])
 
     manifest = {
@@ -91,6 +111,8 @@ def build_task_manifest(task_dir: Path, task: VideoTask, settings: Settings, out
                 ) else None,
             },
             'duration_plan': duration_plan,
+            'douyin_strategy': douyin_strategy,
+            'publish_package': douyin_package,
             'narration_strategy': {
                 'quality_first_enabled': settings.quality_first_enabled,
                 'theme_rewrite_enabled': settings.narrative_theme_rewrite_enabled,
@@ -106,6 +128,12 @@ def build_task_manifest(task_dir: Path, task: VideoTask, settings: Settings, out
                 'clip_rhythm_min_visual_clip_seconds': settings.clip_rhythm_min_visual_clip_seconds,
                 'clip_opening_hook_enabled': settings.clip_opening_hook_enabled,
                 'clip_opening_hook_seconds': settings.clip_opening_hook_seconds,
+                'scene_detector': settings.scene_detector,
+                'scene_detector_allow_fallback': settings.scene_detector_allow_fallback,
+                'transnetv2_command': settings.transnetv2_command,
+                'douyin_strategy_enabled': settings.douyin_strategy_enabled,
+                'viral_quality_enabled': settings.viral_quality_enabled,
+                'douyin_packager_enabled': settings.douyin_packager_enabled,
                 'quality_freeze_detect_enabled': settings.quality_freeze_detect_enabled,
                 'quality_freeze_detect_min_seconds': settings.quality_freeze_detect_min_seconds,
                 'quality_freeze_detect_sample_fps': settings.quality_freeze_detect_sample_fps,
@@ -115,6 +143,7 @@ def build_task_manifest(task_dir: Path, task: VideoTask, settings: Settings, out
             'transcript_segments': len(transcript) if isinstance(transcript, list) else 0,
             'scenes': len(scenes) if isinstance(scenes, list) else 0,
             'story_events': len(story_events) if isinstance(story_events, list) else 0,
+            'story_timeline_bindings': len(story_timeline.get('segment_bindings', [])) if isinstance(story_timeline, dict) else 0,
             'narration_segments': len(script) if isinstance(script, list) else 0,
             'keyframes': len(list((task_dir / 'scenes' / 'keyframes').glob('*.jpg'))),
         },
@@ -122,6 +151,23 @@ def build_task_manifest(task_dir: Path, task: VideoTask, settings: Settings, out
             'overall_score': quality_report.get('overall_score'),
             'issues': quality_report.get('issues', []),
             'recommendation': quality_report.get('recommendation'),
+            'human_like': {
+                'human_like_score': humanlike_visual_quality.get('human_like_score'),
+                'hook_score': humanlike_visual_quality.get('hook_score'),
+                'visual_match': humanlike_visual_quality.get('visual_match'),
+                'editing_rhythm': humanlike_visual_quality.get('editing_rhythm'),
+                'timeline_coherence': humanlike_visual_quality.get('timeline_coherence'),
+                'voice_expression': humanlike_visual_quality.get('voice_expression'),
+                'subtitle_readability': humanlike_visual_quality.get('subtitle_readability'),
+                'issues': humanlike_visual_quality.get('issues', []),
+            },
+            'viral': {
+                'viral_score': viral_quality_report.get('viral_score'),
+                'ok': viral_quality_report.get('ok'),
+                'component_scores': viral_quality_report.get('component_scores', {}),
+                'issues': viral_quality_report.get('issues', []),
+                'recommendations': viral_quality_report.get('recommendations', []),
+            },
             'llm': {
                 'ok': llm_quality_report.get('ok'),
                 'overall_score': llm_quality_report.get('overall_score'),

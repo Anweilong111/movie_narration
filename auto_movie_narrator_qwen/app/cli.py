@@ -94,6 +94,11 @@ def _apply_env(args: argparse.Namespace) -> None:
         os.environ['FFMPEG_VIDEO_ENCODER'] = 'libx264'
         os.environ['FINAL_SPEEDFIT_ENABLED'] = 'false'
         os.environ['LLM_QUALITY_MODE'] = 'full'
+    if getattr(args, 'legacy_workflow', False):
+        os.environ['LEGACY_WORKFLOW_ENABLED'] = 'true'
+        os.environ['CLIP_STORY_FIRST_ENABLED'] = 'false'
+        os.environ['NARRATIVE_DURATION_BUDGET_ENABLED'] = 'false'
+        os.environ.setdefault('CLIP_OPENING_HOOK_ENABLED', 'true')
     env_overrides = {
         'fast_scene_target': 'FAST_QUALITY_TARGET_SCENE_COUNT',
         'fast_grid_frames': 'FAST_QUALITY_GRID_KEYFRAMES_PER_SCENE',
@@ -392,6 +397,7 @@ def generate(args: argparse.Namespace) -> int:
         'fast_quality': {
             'enabled': settings.fast_quality_enabled,
             'quality_first_enabled': settings.quality_first_enabled,
+            'legacy_workflow_enabled': settings.legacy_workflow_enabled,
             'turbo40_enabled': settings.turbo40_enabled,
             'target_scene_count': settings.fast_quality_target_scene_count,
             'vision_concurrency': settings.vision_concurrency,
@@ -403,9 +409,14 @@ def generate(args: argparse.Namespace) -> int:
             'ffmpeg_video_encoder': settings.ffmpeg_video_encoder,
             'final_speedfit_enabled': settings.final_speedfit_enabled,
             'llm_quality_mode': settings.llm_quality_mode,
+            'scene_detector': settings.scene_detector,
+            'scene_detector_allow_fallback': settings.scene_detector_allow_fallback,
+            'transnetv2_command': settings.transnetv2_command,
             'narrative_force_model_script': settings.narrative_force_model_script,
             'clip_fragment_min_seconds': settings.clip_fragment_min_seconds,
             'clip_fragment_max_seconds': settings.clip_fragment_max_seconds,
+            'clip_story_first_enabled': settings.clip_story_first_enabled,
+            'narrative_duration_budget_enabled': settings.narrative_duration_budget_enabled,
         },
         'artifacts': {
             'task': str(task_dir / 'task.json'),
@@ -415,11 +426,15 @@ def generate(args: argparse.Namespace) -> int:
             'script': str(task_dir / 'script' / 'narration_script.json'),
             'script_with_audio': str(task_dir / 'script' / 'narration_with_audio.json'),
             'subtitle': str(task_dir / 'render' / 'subtitle.srt'),
+            'humanlike_visual_quality': str(task_dir / 'review' / 'humanlike_visual_quality.json'),
             'quality_report': str(task_dir / 'review' / 'quality_report.json'),
             'llm_quality_report': str(task_dir / 'review' / 'llm_quality_report.json'),
             'clip_plan': str(task_dir / 'edit' / 'clip_plan.json'),
+            'clip_planner_report': str(task_dir / 'edit' / 'clip_planner_report.json'),
+            'clip_reedit_report': str(task_dir / 'edit' / 'clip_reedit_report.json'),
             'clip_rhythm_report': str(task_dir / 'edit' / 'clip_rhythm_report.json'),
             'story_events': str(task_dir / 'analysis' / 'story_events.json'),
+            'story_timeline': str(task_dir / 'analysis' / 'story_timeline.json'),
             'scene_summaries': str(task_dir / 'analysis' / 'scene_summaries.json'),
             'style_profile': str(task_dir / 'analysis' / 'style_profile.json'),
             'duration_plan': str(task_dir / 'analysis' / 'duration_plan.json'),
@@ -475,6 +490,7 @@ def build_parser() -> argparse.ArgumentParser:
     generate_parser.add_argument('--workdir', default=None, help='Override APP_WORKDIR for generated artifacts.')
     generate_parser.add_argument('--fast-quality', action='store_true', help='Use the sub-1h quality-preserving pipeline profile.')
     generate_parser.add_argument('--quality-first', action='store_true', help='Use the highest-originality profile; prioritizes script quality and visual analysis over runtime.')
+    generate_parser.add_argument('--legacy-workflow', action='store_true', help='Use the previous renderer clip-plan workflow instead of the humanlike story-timeline replanner.')
     generate_parser.add_argument('--turbo40', action='store_true', help='Use the balanced full workflow profile targeting <=40 minutes when API latency is stable.')
     generate_parser.add_argument('--fast-scene-target', type=int, default=None, help='Target analysis scene count for --fast-quality.')
     generate_parser.add_argument('--fast-grid-frames', type=int, default=None, help='Keyframes used to build each scene overview grid in --fast-quality.')

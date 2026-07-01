@@ -94,6 +94,15 @@ class SceneSummary(BaseModel):
     emotion: str = 'unknown'
     importance: float = 0.5
     clip_value: str = 'medium'
+    visual_function: str = '转场镜头'
+    shot_type: str = 'unknown'
+    motion_level: float = 0.5
+    face_visible: bool = False
+    visual_quality: float = 0.5
+    brightness: str = 'normal'
+    subtitle_safe_area: str = 'unknown'
+    best_use: str = 'support'
+    bad_clip_reason: str = ''
     anchor_start: Optional[float] = None
     anchor_end: Optional[float] = None
     transition_hint: str = ''
@@ -125,6 +134,11 @@ class NarrationSegment(BaseModel):
     evidence_quotes: list[str] = Field(default_factory=list)
     visual_evidence: list[str] = Field(default_factory=list)
     transition: str = ''
+    visual_intent: str = ''
+    preferred_visual_function: str = ''
+    editing_pace: str = 'medium'
+    must_show: list[str] = Field(default_factory=list)
+    avoid_visuals: list[str] = Field(default_factory=list)
     recommended_clip_start: float
     recommended_clip_end: float
     expected_duration: Optional[float] = None
@@ -190,6 +204,7 @@ class HumanLikeQualityReport(BaseModel):
     script_naturalness: float
     visual_match: float
     editing_rhythm: float
+    timeline_coherence: float = 1.0
     voice_expression: float
     subtitle_readability: float
     factual_consistency: float

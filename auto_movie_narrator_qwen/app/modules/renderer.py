@@ -8,8 +8,9 @@ import re
 from app.config import get_settings
 from app.models import ClipPlanItem, NarrationSegment, VoiceProfile
 from app.modules.ffmpeg_tools import concat_audios, concat_videos, cut_clip, ffprobe_duration, render_final, run_cmd
+from app.modules.subtitle_styler import build_semantic_subtitle_cues, style_ass_text
 from app.providers.qwen_tts import QwenTTSClient
-from app.utils.json_utils import save_json
+from app.utils.json_utils import load_json, save_json
 from app.utils.timecode import seconds_to_srt_time
 
 
@@ -90,6 +91,12 @@ def _is_horror_narration_style(style: str) -> bool:
 
 def generate_tts_and_subtitles(task_dir: Path, script: list[NarrationSegment], voice: VoiceProfile, style: str) -> list[NarrationSegment]:
     settings = get_settings()
+    script = [
+        seg.model_copy(deep=True)
+        for seg in script
+    ]
+    _ensure_no_repeated_voiceovers(script)
+    _apply_humanlike_voice_pacing(script, settings)
     tts_dir = task_dir / 'tts'
     render_dir = task_dir / 'render'
     tts_dir.mkdir(parents=True, exist_ok=True)
@@ -98,7 +105,8 @@ def generate_tts_and_subtitles(task_dir: Path, script: list[NarrationSegment], v
     jobs = []
     for seg in script:
         out = tts_dir / f'voice_{seg.segment_id:03d}.wav'
-        if not _audio_file_ok(out, seg.voiceover):
+        instruction = build_tts_instruction(style, seg.emotion, seg.speed)
+        if not _audio_file_ok(out, seg.voiceover, voice, instruction):
             jobs.append((seg, out))
 
     concurrency = max(1, int(settings.tts_concurrency or 1))
@@ -132,11 +140,68 @@ def generate_tts_and_subtitles(task_dir: Path, script: list[NarrationSegment], v
             audio_paths.append(str(pause_path))
             current += pause
 
+    concat_audios(audio_paths, str(tts_dir / 'voice_full.wav'))
     concat_audios(audio_paths, str(tts_dir / 'voice_full.aac'))
     generate_srt(script, str(render_dir / 'subtitle.srt'))
     generate_ass(script, str(render_dir / 'subtitle.ass'))
     save_json(task_dir / 'script' / 'narration_with_audio.json', script)
     return script
+
+
+def _ensure_no_repeated_voiceovers(script: list[NarrationSegment]) -> None:
+    seen: dict[str, int] = {}
+    repeated: list[tuple[int, int]] = []
+    for seg in script:
+        key = re.sub(r'[\s\u3000\u3002\uff0c\uff01\uff1f\uff1b,;.!?:"\'\u201c\u201d\u2018\u2019]+', '', str(seg.voiceover or '')).lower()
+        if len(key) < 12:
+            continue
+        previous = seen.get(key)
+        if previous is None:
+            seen[key] = int(seg.segment_id)
+        else:
+            repeated.append((previous, int(seg.segment_id)))
+    if repeated:
+        pairs = ', '.join(f'{a}->{b}' for a, b in repeated[:5])
+        raise RuntimeError(
+            f'Narration script contains repeated full voiceover segments ({pairs}); '
+            'regenerate or repair the script before TTS/subtitle generation.'
+        )
+
+
+def _story_first_order_script(script: list[NarrationSegment], enabled: bool = True) -> list[NarrationSegment]:
+    if not enabled or len(script) <= 1:
+        return script
+    return sorted(
+        script,
+        key=lambda seg: (
+            0 if int(seg.segment_id) == 1 else 1,
+            float(seg.recommended_clip_start),
+            float(seg.recommended_clip_end),
+            int(seg.segment_id),
+        ),
+    )
+
+
+def _apply_humanlike_voice_pacing(script: list[NarrationSegment], settings: Any) -> None:
+    total = len(script)
+    if total <= 0:
+        return
+    climax_pause = max(0.0, float(settings.climax_pause_after_min_seconds or 0.0))
+    reflection_pause = max(climax_pause, float(settings.reflection_pause_after_min_seconds or 0.0))
+    for idx, seg in enumerate(script, 1):
+        ratio = idx / max(total, 1)
+        pause = max(0.0, float(seg.pause_after or 0.0))
+        if idx == 1:
+            seg.pause_after = max(pause, min(climax_pause, 0.45))
+            if seg.editing_pace == 'medium':
+                seg.editing_pace = 'fast'
+        elif ratio >= 0.88:
+            seg.pause_after = max(pause, reflection_pause)
+            seg.editing_pace = 'slow'
+        elif ratio >= 0.72:
+            seg.pause_after = max(pause, climax_pause)
+            if seg.editing_pace == 'medium':
+                seg.editing_pace = 'fast'
 
 
 def _synthesize_segment(seg: NarrationSegment, out: Path, voice: VoiceProfile, style: str) -> str:
@@ -145,23 +210,39 @@ def _synthesize_segment(seg: NarrationSegment, out: Path, voice: VoiceProfile, s
     last_error: Exception | None = None
     for _ in range(attempts):
         try:
+            instruction = build_tts_instruction(style, seg.emotion, seg.speed)
             client.synthesize(
                 text=seg.voiceover,
                 voice=voice.voice_id,
                 output_path=str(out),
                 model=voice.model,
                 language_type='Chinese',
-                instructions=build_tts_instruction(style, seg.emotion, seg.speed),
+                instructions=instruction,
                 optimize_instructions=True,
             )
             last_error = None
+            _write_tts_meta_sidecar(out, voice, instruction)
             break
         except Exception as exc:
             last_error = exc
     if last_error is not None:
         raise last_error
+    _normalize_audio_file(out)
     _write_tts_text_sidecar(out, seg.voiceover)
     return str(out)
+
+
+def _normalize_audio_file(path: Path) -> None:
+    tmp = path.with_suffix('.normalized.wav')
+    run_cmd([
+        'ffmpeg', '-y',
+        '-i', str(path),
+        '-ac', '1',
+        '-ar', '24000',
+        '-c:a', 'pcm_s16le',
+        str(tmp),
+    ])
+    tmp.replace(path)
 
 
 def generate_srt(script: list[NarrationSegment], output_path: str) -> str:
@@ -215,31 +296,59 @@ def generate_ass(script: list[NarrationSegment], output_path: str) -> str:
             f'&H00101010,&H8A000000,1,0,0,0,100,100,0,0,1,{outline:.1f},{shadow:.1f},'
             f'{alignment},{margin_l},{margin_r},{margin_v},1'
         ),
+        (
+            f'Style: Hook,{font_family},{font_size + 4},&H00FFFFFF,&H000000FF,'
+            f'&H000A0A0A,&HA0000000,1,0,0,0,100,100,0,0,1,{outline + 0.4:.1f},{shadow:.1f},'
+            f'{alignment},{margin_l},{margin_r},{margin_v},1'
+        ),
+        (
+            f'Style: Ending,{font_family},{font_size},&H00F4F4F4,&H000000FF,'
+            f'&H00101010,&H8A000000,1,0,0,0,100,100,0,0,1,{outline:.1f},{shadow:.1f},'
+            f'{alignment},{margin_l},{margin_r},{margin_v},1'
+        ),
         '',
         '[Events]',
         'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text',
     ]
-    for _, cue_start, cue_end, chunk in _iter_subtitle_cues(script):
-        lines.append(
-            'Dialogue: 0,{start},{end},Default,,0,0,0,,{text}'.format(
-                start=_seconds_to_ass_time(cue_start),
-                end=_seconds_to_ass_time(cue_end),
-                text=_ass_text(chunk),
+    if settings.legacy_workflow_enabled:
+        for _, cue_start, cue_end, chunk in _iter_legacy_subtitle_cues(script):
+            lines.append(
+                'Dialogue: 0,{start},{end},Default,,0,0,0,,{text}'.format(
+                    start=_seconds_to_ass_time(cue_start),
+                    end=_seconds_to_ass_time(cue_end),
+                    text=_ass_text(chunk),
+                )
             )
-        )
+    else:
+        for cue in build_semantic_subtitle_cues(script):
+            lines.append(
+                'Dialogue: 0,{start},{end},Default,,0,0,0,,{text}'.format(
+                    start=_seconds_to_ass_time(cue.start),
+                    end=_seconds_to_ass_time(cue.end),
+                    text=style_ass_text(cue.text, cue.keywords),
+                )
+                .replace(',Default,,', f',{cue.style},,')
+            )
     Path(output_path).write_text('\n'.join(lines), encoding='utf-8')
     return output_path
 
 
 def _iter_subtitle_cues(script: list[NarrationSegment]) -> list[tuple[int, float, float, str]]:
+    if get_settings().legacy_workflow_enabled:
+        return _iter_legacy_subtitle_cues(script)
+    return [(cue.cue_id, cue.start, cue.end, cue.text) for cue in build_semantic_subtitle_cues(script)]
+
+
+def _iter_legacy_subtitle_cues(script: list[NarrationSegment]) -> list[tuple[int, float, float, str]]:
     cues = []
     cue_id = 1
     for seg in script:
         start = float(seg.audio_start or 0)
         end = float(seg.audio_end or start)
-        chunks = _subtitle_chunks(seg.subtitle or seg.voiceover)
+        subtitle_text = _subtitle_text_for_segment(seg)
+        chunks = _subtitle_chunks(subtitle_text)
         if not chunks:
-            chunks = [_wrap_subtitle_lines(seg.subtitle or seg.voiceover)]
+            chunks = [_wrap_subtitle_lines(subtitle_text)]
         cue_duration = max(0.8, (end - start) / max(len(chunks), 1))
         for chunk_idx, chunk in enumerate(chunks):
             cue_start = start + cue_duration * chunk_idx
@@ -249,6 +358,76 @@ def _iter_subtitle_cues(script: list[NarrationSegment]) -> list[tuple[int, float
             cues.append((cue_id, cue_start, cue_end, chunk))
             cue_id += 1
     return cues
+
+
+def _subtitle_text_for_segment(seg: NarrationSegment) -> str:
+    subtitle = str(seg.subtitle or '').strip()
+    voiceover = str(seg.voiceover or '').strip()
+    if not subtitle:
+        return voiceover
+    if voiceover and _looks_like_truncated_subtitle(subtitle, voiceover):
+        return voiceover
+    return subtitle
+
+
+def _looks_like_truncated_subtitle(subtitle: str, voiceover: str) -> bool:
+    compact_subtitle = re.sub(r'\s+', '', subtitle)
+    compact_voiceover = re.sub(r'\s+', '', voiceover)
+    if not compact_subtitle or len(compact_subtitle) >= len(compact_voiceover):
+        return False
+    if not compact_voiceover.startswith(compact_subtitle):
+        return False
+    if compact_subtitle[-1] not in '。！？!?；;…':
+        return True
+    return len(compact_subtitle) < len(compact_voiceover) * 0.78
+
+
+def _subtitle_cue_ranges(start: float, end: float, chunks: list[str]) -> list[tuple[float, float]]:
+    if not chunks:
+        return []
+    start = max(0.0, float(start))
+    end = max(start + 0.01, float(end))
+    total_duration = end - start
+    weights = [_subtitle_duration_weight(chunk) for chunk in chunks]
+    total_weight = sum(weights) or float(len(chunks))
+    min_cue_duration = 0.8
+    if total_duration >= len(chunks) * min_cue_duration:
+        extra_duration = total_duration - len(chunks) * min_cue_duration
+        durations = [
+            min_cue_duration + extra_duration * weight / total_weight
+            for weight in weights
+        ]
+    else:
+        durations = [
+            total_duration * weight / total_weight
+            for weight in weights
+        ]
+
+    ranges = []
+    cursor = start
+    for idx, duration in enumerate(durations):
+        cue_start = cursor
+        cue_end = end if idx == len(durations) - 1 else min(end, cursor + duration)
+        ranges.append((cue_start, cue_end))
+        cursor = cue_end
+    return ranges
+
+
+def _subtitle_duration_weight(text: str) -> float:
+    compact = re.sub(r'\s+', '', text or '')
+    if not compact:
+        return 1.0
+    weight = 0.0
+    for char in compact:
+        if '\u4e00' <= char <= '\u9fff':
+            weight += 1.0
+        elif char.isalnum():
+            weight += 0.55
+        elif char in '，,。！？!?；;：:':
+            weight += 0.25
+        else:
+            weight += 0.35
+    return max(1.0, weight)
 
 
 def _seconds_to_ass_time(seconds: float) -> str:
@@ -465,11 +644,16 @@ def _apply_opening_hook_scene(
     settings = get_settings()
     if not plan or not settings.clip_opening_hook_enabled or not shot_bank:
         return plan, None
-    hook = _select_opening_hook(shot_bank)
+    first = plan[0]
+    padding = max(0.0, float(settings.clip_story_window_padding_seconds or 0.0))
+    story_window = (
+        max(0.0, float(first.clip_start) - padding),
+        float(first.clip_end) + padding,
+    )
+    hook = _select_opening_hook(shot_bank, story_window)
     if not hook:
         return plan, None
 
-    first = plan[0]
     first_duration = max(0.2, float(first.target_duration or 0.0), float(first.clip_end) - float(first.clip_start))
     hook_seconds = max(0.5, min(first_duration, float(settings.clip_opening_hook_seconds or 3.6)))
     hook_start, hook_end = _clip_window_from_shot(hook, hook_seconds, source_duration)
@@ -517,12 +701,23 @@ def _apply_opening_hook_scene(
     }
 
 
-def _select_opening_hook(shot_bank: dict[str, Any]) -> dict[str, Any] | None:
+def _select_opening_hook(shot_bank: dict[str, Any], story_window: tuple[float, float] | None = None) -> dict[str, Any] | None:
     candidates = []
-    for group_name in ('hook_clips', 'conflict_clips', 'emotion_clips'):
+    for group_name in ('hook_clips', 'action_clips', 'reaction_clips', 'conflict_clips', 'emotion_clips'):
         group = shot_bank.get(group_name)
         if isinstance(group, list):
             candidates.extend(item for item in group if isinstance(item, dict))
+    if story_window is not None:
+        start, end = story_window
+        candidates = [
+            item for item in candidates
+            if _overlap_seconds(
+                _float_value(item.get('start'), 0.0),
+                _float_value(item.get('end'), 0.0),
+                start,
+                end,
+            ) > 0
+        ]
     if not candidates:
         return None
     function_bonus = {
@@ -531,6 +726,7 @@ def _select_opening_hook(shot_bank: dict[str, Any]) -> dict[str, Any] | None:
         '人物特写': 0.18,
         '象征镜头': 0.12,
         '环境空镜': 0.02,
+        '对白镜头': -0.08,
     }
 
     def score(item: dict[str, Any]) -> tuple[float, float]:
@@ -538,7 +734,11 @@ def _select_opening_hook(shot_bank: dict[str, Any]) -> dict[str, Any] | None:
         visual_function = str(item.get('visual_function') or '')
         duration = max(0.0, _float_value(item.get('end'), 0.0) - _float_value(item.get('start'), 0.0))
         duration_bonus = 0.08 if duration >= 2.5 else -0.1
-        return base + function_bonus.get(visual_function, 0.0) + duration_bonus, duration
+        story_bias = 0.0
+        if story_window is not None:
+            story_start, _ = story_window
+            story_bias = min(0.42, max(0.0, _float_value(item.get('start'), 0.0) - story_start) * 0.0028)
+        return base + function_bonus.get(visual_function, 0.0) + duration_bonus - story_bias, duration
 
     return max(candidates, key=score)
 
@@ -590,9 +790,16 @@ def _float_value(value: Any, default: float) -> float:
 
 
 def _generate_single_clip_plan(script: list[NarrationSegment], source_duration: float | None = None) -> list[ClipPlanItem]:
+    settings = get_settings()
+    max_backstep = max(0.0, float(settings.clip_story_max_adjacent_backstep_seconds or 0.0))
+    boundary_guard = max(0.0, float(settings.clip_story_boundary_guard_seconds or 0.0))
     plan: list[ClipPlanItem] = []
     used_ranges: list[tuple[float, float]] = []
-    for seg in script:
+    previous_story_floor: float | None = None
+    for idx, seg in enumerate(script):
+        opening_hook_segment = _is_opening_hook_segment(idx, script, settings)
+        strict_story_bounds = _story_clip_bounds(seg, opening_hook_segment, settings)
+        next_story_start = _next_recommended_start(script, idx)
         voice_duration = max(0.5, (seg.audio_end or 0) - (seg.audio_start or 0) + max(0.0, float(seg.pause_after or 0.0)))
         clip_start, clip_end = _expand_clip_to_duration(
             seg.recommended_clip_start,
@@ -606,8 +813,22 @@ def _generate_single_clip_plan(script: list[NarrationSegment], source_duration: 
             voice_duration,
             used_ranges,
             source_duration,
+            strict_story_bounds,
         )
+        clip_start, clip_end = _fit_clip_inside_bounds(clip_start, clip_end, strict_story_bounds, source_duration)
+        if settings.clip_story_first_enabled and not opening_hook_segment:
+            clip_start, clip_end = _fit_clip_before_next_story_boundary(
+                clip_start,
+                clip_end,
+                next_story_start,
+                boundary_guard,
+                source_duration,
+            )
+            clip_start, clip_end = _keep_story_clip_after_previous(clip_start, clip_end, previous_story_floor, source_duration)
+            clip_start, clip_end = _fit_clip_inside_bounds(clip_start, clip_end, strict_story_bounds, source_duration)
         used_ranges.append((clip_start, clip_end))
+        if not opening_hook_segment:
+            previous_story_floor = _next_story_floor(previous_story_floor, clip_end, max_backstep)
         plan.append(ClipPlanItem(
             segment_id=seg.segment_id,
             clip_start=clip_start,
@@ -625,13 +846,28 @@ def _generate_fragmented_clip_plan(script: list[NarrationSegment], source_durati
     max_seconds = max(min_seconds, float(settings.clip_fragment_max_seconds or 5.0))
     gap_seconds = max(0.0, float(settings.clip_fragment_gap_seconds or 0.0))
     context_seconds = max(0.0, float(settings.clip_fragment_context_seconds or 0.0))
+    max_backstep = max(0.0, float(settings.clip_story_max_adjacent_backstep_seconds or 0.0))
+    boundary_guard = max(0.0, float(settings.clip_story_boundary_guard_seconds or 0.0))
 
     plan: list[ClipPlanItem] = []
     used_ranges: list[tuple[float, float]] = []
-    for seg in script:
+    previous_segment_story_floor: float | None = None
+    for seg_idx, seg in enumerate(script):
+        opening_hook_segment = _is_opening_hook_segment(seg_idx, script, settings)
+        strict_story_bounds = _story_clip_bounds(seg, opening_hook_segment, settings)
+        next_story_start = _next_recommended_start(script, seg_idx)
         voice_duration = max(0.5, (seg.audio_end or 0) - (seg.audio_start or 0) + max(0.0, float(seg.pause_after or 0.0)))
         fragment_durations = _fragment_durations(voice_duration, min_seconds, max_seconds)
         voice_cursor = float(seg.audio_start or 0.0)
+        segment_story_max_end: float | None = None
+        segment_context_seconds = (
+            0.0
+            if strict_story_bounds is not None
+            else 0.0
+            if settings.clip_story_first_enabled and seg_idx in {0, len(script) - 1}
+            else context_seconds
+        )
+        segment_next_story_start = None if opening_hook_segment else next_story_start
         for fragment_idx, fragment_duration in enumerate(fragment_durations):
             clip_start, clip_end = _fragment_clip_window(
                 seg.recommended_clip_start,
@@ -641,7 +877,9 @@ def _generate_fragmented_clip_plan(script: list[NarrationSegment], source_durati
                 len(fragment_durations),
                 source_duration,
                 gap_seconds,
-                context_seconds,
+                segment_context_seconds,
+                segment_next_story_start,
+                boundary_guard,
             )
             clip_start, clip_end = _avoid_reused_clip_window(
                 clip_start,
@@ -649,8 +887,19 @@ def _generate_fragmented_clip_plan(script: list[NarrationSegment], source_durati
                 fragment_duration,
                 used_ranges,
                 source_duration,
+                strict_story_bounds,
             )
+            clip_start, clip_end = _fit_clip_inside_bounds(clip_start, clip_end, strict_story_bounds, source_duration)
+            if settings.clip_story_first_enabled:
+                clip_start, clip_end = _keep_story_clip_after_previous(
+                    clip_start,
+                    clip_end,
+                    previous_segment_story_floor,
+                    source_duration,
+                )
+                clip_start, clip_end = _fit_clip_inside_bounds(clip_start, clip_end, strict_story_bounds, source_duration)
             used_ranges.append((clip_start, clip_end))
+            segment_story_max_end = clip_end if segment_story_max_end is None else max(segment_story_max_end, clip_end)
             plan.append(ClipPlanItem(
                 segment_id=seg.segment_id,
                 clip_start=clip_start,
@@ -660,7 +909,105 @@ def _generate_fragmented_clip_plan(script: list[NarrationSegment], source_durati
                 target_duration=fragment_duration,
             ))
             voice_cursor += fragment_duration
+        if segment_story_max_end is not None and not opening_hook_segment:
+            previous_segment_story_floor = _next_story_floor(previous_segment_story_floor, segment_story_max_end, max_backstep)
     return plan
+
+
+def _story_clip_bounds(
+    seg: NarrationSegment,
+    opening_hook_segment: bool,
+    settings: Any,
+) -> tuple[float, float] | None:
+    if opening_hook_segment:
+        return _opening_hook_clip_bounds(seg)
+    if not bool(settings.clip_story_first_enabled):
+        return None
+    try:
+        start = max(0.0, float(seg.recommended_clip_start))
+        end = max(start + 0.2, float(seg.recommended_clip_end))
+    except (TypeError, ValueError):
+        return None
+    if end <= start + 0.2:
+        return None
+    return start, end
+
+
+def _opening_hook_clip_bounds(seg: NarrationSegment) -> tuple[float, float] | None:
+    anchors = _visual_time_anchors(seg)
+    try:
+        recommended_start = max(0.0, float(seg.recommended_clip_start))
+        recommended_end = max(recommended_start + 0.2, float(seg.recommended_clip_end))
+    except (TypeError, ValueError):
+        recommended_start = 0.0
+        recommended_end = 0.0
+
+    if anchors:
+        anchor = anchors[0]
+        recommended_span = max(0.0, recommended_end - recommended_start)
+        span = min(30.0, max(8.0, recommended_span or 18.0))
+        start = max(0.0, anchor - 1.0)
+        return start, start + span
+    if recommended_end > recommended_start:
+        return recommended_start, recommended_end
+    return None
+
+
+def _visual_time_anchors(seg: NarrationSegment) -> list[float]:
+    texts: list[str] = []
+    texts.extend(str(item or '') for item in seg.visual_evidence)
+    texts.extend(str(item or '') for item in seg.evidence_quotes)
+    texts.extend(str(item or '') for item in seg.must_show)
+    anchors: list[float] = []
+    for text in texts:
+        for match in re.finditer(r'(?<!\d)(\d{1,6}(?:\.\d+)?)\s*s\s*[:：]', text):
+            try:
+                anchors.append(float(match.group(1)))
+            except ValueError:
+                continue
+    return anchors
+
+
+def _fit_clip_inside_bounds(
+    start: float,
+    end: float,
+    bounds: tuple[float, float] | None,
+    source_duration: float | None = None,
+) -> tuple[float, float]:
+    if bounds is None:
+        return start, end
+    bound_start, bound_end = bounds
+    duration = max(0.2, float(end) - float(start))
+    span = max(0.0, float(bound_end) - float(bound_start))
+    if span + 0.05 < duration:
+        return start, end
+    next_start = min(max(float(start), float(bound_start)), max(float(bound_start), float(bound_end) - duration))
+    next_end = next_start + duration
+    if source_duration is not None and source_duration > 0:
+        next_start = min(next_start, max(0.0, float(source_duration) - duration))
+        next_end = next_start + duration
+    return next_start, max(next_start + 0.2, next_end)
+
+
+def _is_opening_hook_segment(idx: int, script: list[NarrationSegment], settings: Any) -> bool:
+    if not (
+        bool(settings.clip_opening_hook_enabled)
+        and idx == 0
+        and len(script) > 1
+    ):
+        return False
+    first = script[0]
+    intent = str(first.visual_intent or '').lower()
+    if 'hook' in intent or '开头' in str(first.visual_intent or ''):
+        return True
+    next_start = _next_recommended_start(script, 0)
+    if next_start is None:
+        return False
+    try:
+        first_start = float(first.recommended_clip_start)
+    except (TypeError, ValueError):
+        return False
+    return first_start > next_start + 5.0
 
 
 def _fragment_durations(target_duration: float, min_seconds: float, max_seconds: float) -> list[float]:
@@ -685,6 +1032,57 @@ def _fragment_durations(target_duration: float, min_seconds: float, max_seconds:
     return [max(0.2, duration) for duration in durations]
 
 
+def _keep_story_clip_after_previous(
+    start: float,
+    end: float,
+    previous_floor: float | None,
+    source_duration: float | None = None,
+) -> tuple[float, float]:
+    if previous_floor is None or start + 0.05 >= previous_floor:
+        return start, end
+    duration = max(0.2, float(end) - float(start))
+    next_start = max(float(start), float(previous_floor))
+    if source_duration is not None and source_duration > 0:
+        next_start = min(next_start, max(0.0, float(source_duration) - duration))
+    next_end = next_start + duration
+    return next_start, max(next_start + 0.2, next_end)
+
+
+def _fit_clip_before_next_story_boundary(
+    start: float,
+    end: float,
+    next_story_start: float | None,
+    boundary_guard: float,
+    source_duration: float | None = None,
+) -> tuple[float, float]:
+    if next_story_start is None:
+        return start, end
+    duration = max(0.2, float(end) - float(start))
+    boundary_end = max(0.0, float(next_story_start) - max(0.0, float(boundary_guard)))
+    if end <= boundary_end + 0.05:
+        return start, end
+    shifted_start = max(0.0, boundary_end - duration)
+    if source_duration is not None and source_duration > 0:
+        shifted_start = min(shifted_start, max(0.0, float(source_duration) - duration))
+    return shifted_start, shifted_start + duration
+
+
+def _next_recommended_start(script: list[NarrationSegment], idx: int) -> float | None:
+    if idx + 1 >= len(script):
+        return None
+    try:
+        return float(script[idx + 1].recommended_clip_start)
+    except (TypeError, ValueError):
+        return None
+
+
+def _next_story_floor(previous_floor: float | None, current_end: float, max_backstep: float) -> float:
+    floor = max(0.0, float(current_end) - max(0.0, float(max_backstep)))
+    if previous_floor is None:
+        return floor
+    return max(float(previous_floor), floor)
+
+
 def _fragment_clip_window(
     start: float,
     end: float,
@@ -694,6 +1092,8 @@ def _fragment_clip_window(
     source_duration: float | None = None,
     gap_seconds: float = 1.0,
     context_seconds: float = 18.0,
+    next_story_start: float | None = None,
+    boundary_guard_seconds: float = 0.0,
 ) -> tuple[float, float]:
     target_duration = max(0.2, float(target_duration))
     start = max(0.0, float(start))
@@ -708,6 +1108,11 @@ def _fragment_clip_window(
         center = (start + end) / 2
         available_start = center - min_span / 2
         available_end = center + min_span / 2
+
+    if next_story_start is not None and float(next_story_start) > start:
+        boundary_end = max(available_start + target_duration, float(next_story_start) - max(0.0, float(boundary_guard_seconds)))
+        if boundary_end - available_start >= min_span:
+            available_end = min(available_end, boundary_end)
 
     if source_duration is not None and source_duration > 0:
         if available_start < 0:
@@ -767,6 +1172,7 @@ def _avoid_reused_clip_window(
     target_duration: float,
     used_ranges: list[tuple[float, float]],
     source_duration: float | None = None,
+    bounds: tuple[float, float] | None = None,
 ) -> tuple[float, float]:
     if not used_ranges:
         return start, end
@@ -779,6 +1185,11 @@ def _avoid_reused_clip_window(
 
     lower = 0.0
     upper = max(0.0, (source_duration - duration) if source_duration is not None and source_duration > 0 else max(end, start) + duration)
+    if bounds is not None:
+        bound_start, bound_end = bounds
+        if float(bound_end) - float(bound_start) >= duration:
+            lower = max(lower, float(bound_start))
+            upper = min(upper, max(lower, float(bound_end) - duration))
     original_center = (start + end) / 2
     candidates = [start]
     for used_start, used_end in used_ranges:
@@ -824,17 +1235,45 @@ def _write_silence(path: Path, duration: float) -> str:
     return str(path)
 
 
-def _audio_file_ok(path: Path, expected_text: str | None = None) -> bool:
+def _audio_file_ok(
+    path: Path,
+    expected_text: str | None = None,
+    expected_voice: VoiceProfile | None = None,
+    expected_instruction: str | None = None,
+) -> bool:
     if not path.exists() or path.stat().st_size <= 0:
         return False
     if expected_text is not None:
         sidecar = _tts_text_sidecar(path)
         if not sidecar.exists() or sidecar.read_text(encoding='utf-8') != expected_text:
             return False
+    if expected_voice is not None:
+        meta = load_json(_tts_meta_sidecar(path), default=None)
+        expected_meta = _tts_voice_meta(expected_voice, expected_instruction)
+        if not isinstance(meta, dict) or any(meta.get(k) != v for k, v in expected_meta.items()):
+            return False
     try:
         return ffprobe_duration(str(path)) > 0
     except Exception:
         return False
+
+
+def _write_tts_meta_sidecar(path: Path, voice: VoiceProfile, instruction: str | None = None) -> None:
+    save_json(_tts_meta_sidecar(path), _tts_voice_meta(voice, instruction))
+
+
+def _tts_voice_meta(voice: VoiceProfile, instruction: str | None = None) -> dict[str, str]:
+    return {
+        'provider': str(voice.provider),
+        'model': str(voice.model),
+        'voice_id': str(voice.voice_id),
+        'voice_profile_id': str(voice.id),
+        'instruction': str(instruction or ''),
+    }
+
+
+def _tts_meta_sidecar(path: Path) -> Path:
+    return path.with_suffix('.meta.json')
 
 
 def _write_tts_text_sidecar(path: Path, text: str) -> None:
@@ -867,7 +1306,7 @@ def compose_final(
         subtitle_path = task_dir / 'render' / 'subtitle.srt'
     return render_final(
         str(task_dir / 'edit' / 'cut_video.mp4'),
-        str(task_dir / 'tts' / 'voice_full.aac'),
+        str(_preferred_voice_full_path(task_dir)),
         str(subtitle_path),
         str(task_dir / 'render' / 'final.mp4'),
         background_volume=background_volume,
@@ -885,3 +1324,11 @@ def compose_final(
         vertical_background=settings.final_vertical_background,
         vertical_blur_sigma=settings.final_vertical_blur_sigma,
     )
+
+
+def _preferred_voice_full_path(task_dir: Path) -> Path:
+    wav_path = task_dir / 'tts' / 'voice_full.wav'
+    if wav_path.exists():
+        return wav_path
+    aac_path = task_dir / 'tts' / 'voice_full.aac'
+    return aac_path if aac_path.exists() else task_dir / 'tts' / 'voice_full.wav'

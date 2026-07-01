@@ -25,15 +25,18 @@ from app.config import get_settings
 from app.models import SceneSummary, StoryEvent, TaskStatus, TranscriptSegment
 from app.modules.fast_quality import dialogue_intervals_for_clip_plan
 from app.modules.ffmpeg_tools import ffprobe_duration, speedfit_video
+from app.modules.clip_planner import generate_humanlike_clip_plan, repair_low_score_clip_plan
+from app.modules.humanlike_visual_quality import run_humanlike_visual_quality_check
 from app.modules.llm_quality_check import run_llm_quality_check
 from app.modules.manifest import build_task_manifest
 from app.modules.quality_check import run_quality_check
-from app.modules.renderer import compose_final, cut_and_concat, generate_clip_plan, generate_tts_and_subtitles
+from app.modules.renderer import compose_final, cut_and_concat, generate_tts_and_subtitles
 from app.modules.director_planner import build_director_plan
 from app.modules.duration_planner import explicit_duration_plan, plan_target_duration
 from app.modules.script_writer import generate_narration_script
 from app.modules.shot_bank import build_shot_bank
 from app.modules.style_selector import resolve_narration_style
+from app.modules.story_timeline import build_story_timeline, bind_script_to_story_timeline
 from app.storage import LocalStorage
 from app.utils.json_utils import load_json, save_json
 
@@ -100,6 +103,12 @@ def main(argv: list[str]) -> int:
         task.target_duration,
         task_dir / 'analysis' / 'director_plan.json',
     )
+    story_timeline = build_story_timeline(
+        story_events,
+        director_plan,
+        task_dir / 'analysis' / 'story_timeline.json',
+        source_duration,
+    )
 
     storage.update_status(task_id, TaskStatus.script_generating, 0.64, 'script_generating')
     script = generate_narration_script(
@@ -111,13 +120,52 @@ def main(argv: list[str]) -> int:
         scene_summaries,
         director_plan,
     )
+    story_timeline = bind_script_to_story_timeline(
+        script,
+        story_events,
+        story_timeline,
+        task_dir / 'analysis' / 'story_timeline.json',
+        source_duration,
+    )
 
     storage.update_status(task_id, TaskStatus.voice_generating, 0.74, 'voice_generating')
     voice = storage.get_voice(task.voice_profile_id)
     script = generate_tts_and_subtitles(task_dir, script, voice, task.style)
 
     storage.update_status(task_id, TaskStatus.editing, 0.84, 'editing')
-    plan = generate_clip_plan(script, str(task_dir / 'edit' / 'clip_plan.json'), source_duration)
+    plan = generate_humanlike_clip_plan(
+        script,
+        str(task_dir / 'edit' / 'clip_plan.json'),
+        source_duration,
+        task_dir / 'analysis' / 'shot_bank.json',
+        director_plan=director_plan,
+        story_timeline=story_timeline,
+    )
+    run_humanlike_visual_quality_check(
+        script,
+        plan,
+        task_dir / 'analysis' / 'shot_bank.json',
+        task_dir / 'edit' / 'clip_planner_report.json',
+        task_dir / 'review' / 'humanlike_visual_quality.json',
+        task_dir / 'analysis' / 'story_timeline.json',
+    )
+    plan = repair_low_score_clip_plan(
+        script,
+        str(task_dir / 'edit' / 'clip_plan.json'),
+        source_duration,
+        task_dir / 'analysis' / 'shot_bank.json',
+        task_dir / 'review' / 'humanlike_visual_quality.json',
+        director_plan=director_plan,
+        story_timeline=story_timeline,
+    )
+    run_humanlike_visual_quality_check(
+        script,
+        plan,
+        task_dir / 'analysis' / 'shot_bank.json',
+        task_dir / 'edit' / 'clip_planner_report.json',
+        task_dir / 'review' / 'humanlike_visual_quality.json',
+        task_dir / 'analysis' / 'story_timeline.json',
+    )
     cut_and_concat(task_dir, task.original_video_path, plan, video_encoder=settings.ffmpeg_video_encoder)
 
     storage.update_status(task_id, TaskStatus.rendering, 0.92, 'rendering')

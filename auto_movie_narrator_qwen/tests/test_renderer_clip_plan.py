@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-from app.models import NarrationSegment
+import json
+
+from app.models import NarrationSegment, VoiceProfile, VoiceType
 from app.modules.ffmpeg_tools import _atempo_filter, _mixed_audio_filter
-from app.modules.renderer import _expand_clip_to_duration, build_tts_instruction, generate_ass, generate_clip_plan, generate_srt
+from app.config import get_settings
+from app.modules.renderer import _apply_humanlike_voice_pacing, _expand_clip_to_duration, _iter_subtitle_cues, _select_opening_hook, _story_first_order_script, build_tts_instruction, generate_ass, generate_clip_plan, generate_srt, generate_tts_and_subtitles
 
 
 def test_expand_clip_to_duration_extends_short_clip_near_video_end():
@@ -44,9 +47,9 @@ def test_generate_clip_plan_includes_pause_after_in_visual_duration(tmp_path):
 
     plan = generate_clip_plan(script, str(tmp_path / 'clip_plan.json'), source_duration=30.0)
 
-    assert round(plan[0].target_duration, 3) == 4.75
-    assert round(plan[0].voice_end, 3) == 4.75
-    assert round(plan[0].clip_end - plan[0].clip_start, 3) == 4.75
+    assert round(sum(item.target_duration for item in plan), 3) == 4.75
+    assert round(plan[-1].voice_end, 3) == 4.75
+    assert round(sum(item.clip_end - item.clip_start for item in plan), 3) == 4.75
 
 
 def test_generate_clip_plan_avoids_reusing_same_source_window(tmp_path):
@@ -83,6 +86,340 @@ def test_generate_clip_plan_avoids_reusing_same_source_window(tmp_path):
     assert overlap <= 3.0
 
 
+def test_generate_clip_plan_story_first_does_not_move_later_segment_backward(tmp_path):
+    script = [
+        NarrationSegment(
+            segment_id=1,
+            voiceover='first',
+            subtitle='first',
+            recommended_clip_start=100.0,
+            recommended_clip_end=110.0,
+            audio_start=0.0,
+            audio_end=10.0,
+        ),
+        NarrationSegment(
+            segment_id=2,
+            voiceover='second',
+            subtitle='second',
+            recommended_clip_start=101.0,
+            recommended_clip_end=111.0,
+            audio_start=10.0,
+            audio_end=20.0,
+        ),
+    ]
+
+    plan = generate_clip_plan(script, str(tmp_path / 'clip_plan.json'), source_duration=200.0)
+
+    assert min(item.clip_start for item in plan if item.segment_id == 2) >= min(item.clip_start for item in plan if item.segment_id == 1)
+
+
+def test_story_first_fragmentation_does_not_collapse_next_segment_to_repeats(tmp_path):
+    script = [
+        NarrationSegment(
+            segment_id=1,
+            voiceover='first',
+            subtitle='first',
+            recommended_clip_start=3344.0,
+            recommended_clip_end=3360.0,
+            audio_start=0.0,
+            audio_end=23.0,
+        ),
+        NarrationSegment(
+            segment_id=2,
+            voiceover='second',
+            subtitle='second',
+            recommended_clip_start=3361.0,
+            recommended_clip_end=3378.0,
+            audio_start=23.0,
+            audio_end=46.0,
+        ),
+    ]
+
+    plan = generate_clip_plan(script, str(tmp_path / 'clip_plan.json'), source_duration=6000.0)
+    first_starts = [round(item.clip_start, 3) for item in plan if item.segment_id == 1]
+    second_starts = [round(item.clip_start, 3) for item in plan if item.segment_id == 2]
+
+    assert min(second_starts) >= min(first_starts)
+    assert len(set(second_starts)) >= 5
+
+
+def test_story_first_fragmentation_limits_adjacent_segment_backstep(tmp_path):
+    script = [
+        NarrationSegment(
+            segment_id=1,
+            voiceover='first',
+            subtitle='first',
+            recommended_clip_start=100.0,
+            recommended_clip_end=110.0,
+            audio_start=0.0,
+            audio_end=20.0,
+        ),
+        NarrationSegment(
+            segment_id=2,
+            voiceover='second',
+            subtitle='second',
+            recommended_clip_start=111.0,
+            recommended_clip_end=121.0,
+            audio_start=20.0,
+            audio_end=40.0,
+        ),
+    ]
+
+    plan = generate_clip_plan(script, str(tmp_path / 'clip_plan.json'), source_duration=300.0)
+    first_end = max(item.clip_end for item in plan if item.segment_id == 1)
+    second_start = min(item.clip_start for item in plan if item.segment_id == 2)
+
+    assert first_end - second_start <= get_settings().clip_story_max_adjacent_backstep_seconds + 0.05
+
+
+def test_opening_hook_does_not_advance_story_floor_for_chronological_body(tmp_path):
+    script = [
+        NarrationSegment(
+            segment_id=1,
+            voiceover='late hook',
+            subtitle='late hook',
+            recommended_clip_start=500.0,
+            recommended_clip_end=520.0,
+            audio_start=0.0,
+            audio_end=20.0,
+        ),
+        NarrationSegment(
+            segment_id=2,
+            voiceover='story start',
+            subtitle='story start',
+            recommended_clip_start=10.0,
+            recommended_clip_end=30.0,
+            audio_start=20.0,
+            audio_end=40.0,
+        ),
+    ]
+
+    plan = generate_clip_plan(script, str(tmp_path / 'clip_plan.json'), source_duration=600.0)
+    hook_start = min(item.clip_start for item in plan if item.segment_id == 1)
+    story_start = min(item.clip_start for item in plan if item.segment_id == 2)
+
+    assert hook_start >= 495.0
+    assert story_start < 20.0
+
+
+def test_opening_segment_does_not_pull_pre_hook_context(tmp_path):
+    script = [
+        NarrationSegment(
+            segment_id=1,
+            voiceover='opening',
+            subtitle='opening',
+            recommended_clip_start=100.0,
+            recommended_clip_end=115.0,
+            audio_start=0.0,
+            audio_end=19.0,
+        ),
+        NarrationSegment(
+            segment_id=2,
+            voiceover='next',
+            subtitle='next',
+            recommended_clip_start=360.0,
+            recommended_clip_end=378.0,
+            audio_start=19.0,
+            audio_end=23.0,
+        ),
+    ]
+
+    plan = generate_clip_plan(script, str(tmp_path / 'clip_plan.json'), source_duration=500.0)
+    opening_starts = [item.clip_start for item in plan if item.segment_id == 1]
+
+    assert min(opening_starts) >= 94.0
+
+
+def test_ending_segment_does_not_pull_post_story_context(tmp_path):
+    script = [
+        NarrationSegment(
+            segment_id=1,
+            voiceover='setup',
+            subtitle='setup',
+            recommended_clip_start=100.0,
+            recommended_clip_end=115.0,
+            audio_start=0.0,
+            audio_end=4.0,
+        ),
+        NarrationSegment(
+            segment_id=2,
+            voiceover='ending',
+            subtitle='ending',
+            recommended_clip_start=5880.0,
+            recommended_clip_end=5921.0,
+            audio_start=4.0,
+            audio_end=24.0,
+            pause_after=0.8,
+        ),
+    ]
+
+    plan = generate_clip_plan(script, str(tmp_path / 'clip_plan.json'), source_duration=6000.0)
+    ending_ends = [item.clip_end for item in plan if item.segment_id == 2]
+
+    assert max(ending_ends) <= 5921.05
+
+
+def test_story_first_fragmentation_keeps_reused_windows_inside_story_bounds(tmp_path):
+    script = [
+        NarrationSegment(
+            segment_id=1,
+            voiceover='first beat',
+            subtitle='first beat',
+            recommended_clip_start=100.0,
+            recommended_clip_end=130.0,
+            audio_start=0.0,
+            audio_end=9.0,
+        ),
+        NarrationSegment(
+            segment_id=2,
+            voiceover='second beat',
+            subtitle='second beat',
+            recommended_clip_start=100.0,
+            recommended_clip_end=130.0,
+            audio_start=9.0,
+            audio_end=18.0,
+        ),
+    ]
+
+    plan = generate_clip_plan(script, str(tmp_path / 'clip_plan.json'), source_duration=300.0)
+
+    assert plan
+    for item in plan:
+        assert item.clip_start >= 100.0
+        assert item.clip_end <= 130.05
+
+
+def test_opening_hook_respects_story_window_when_story_first_enabled():
+    shot_bank = {
+        'hook_clips': [
+            {'start': 2958.0, 'end': 2962.0, 'score': 0.99, 'visual_function': '动作镜头'},
+            {'start': 208.0, 'end': 224.0, 'score': 0.8, 'visual_function': '反应镜头'},
+        ]
+    }
+
+    hook = _select_opening_hook(shot_bank, (118.0, 314.0))
+
+    assert hook is not None
+    assert hook['start'] == 208.0
+
+
+def test_opening_hook_uses_visual_anchor_and_avoids_global_bad_hook(monkeypatch, tmp_path):
+    monkeypatch.setenv('CLIP_STORY_FIRST_ENABLED', 'false')
+    get_settings.cache_clear()
+    try:
+        task_dir = tmp_path
+        (task_dir / 'analysis').mkdir(parents=True)
+        (task_dir / 'edit').mkdir(parents=True)
+        (task_dir / 'analysis' / 'shot_bank.json').write_text(
+            json.dumps({
+                'hook_clips': [
+                    {'start': 7350.0, 'end': 7358.0, 'score': 0.99, 'visual_function': '动作镜头', 'reason': 'end credits'},
+                    {'start': 5701.0, 'end': 5710.0, 'score': 0.75, 'visual_function': '人物特写', 'reason': 'blood-stained John Doe'},
+                ]
+            }),
+            encoding='utf-8',
+        )
+        script = [
+            NarrationSegment(
+                segment_id=1,
+                voiceover='future hook',
+                subtitle='future hook',
+                visual_intent='opening hook',
+                visual_evidence=['5701.0s: John Doe stands in the police station lobby wearing a blood-stained white shirt.'],
+                recommended_clip_start=7350.0,
+                recommended_clip_end=7380.0,
+                audio_start=0.0,
+                audio_end=20.0,
+            ),
+            NarrationSegment(
+                segment_id=2,
+                voiceover='story begins',
+                subtitle='story begins',
+                recommended_clip_start=600.0,
+                recommended_clip_end=630.0,
+                audio_start=20.0,
+                audio_end=40.0,
+            ),
+        ]
+
+        plan = generate_clip_plan(script, str(task_dir / 'edit' / 'clip_plan.json'), source_duration=7609.0)
+        opening_starts = [item.clip_start for item in plan if item.segment_id == 1]
+
+        assert opening_starts
+        assert min(opening_starts) >= 5600.0
+        assert max(opening_starts) < 5735.0
+    finally:
+        get_settings.cache_clear()
+
+
+def test_story_first_order_script_sorts_by_recommended_clip_start():
+    script = [
+        NarrationSegment(segment_id=2, voiceover='two', subtitle='two', recommended_clip_start=50.0, recommended_clip_end=60.0, audio_start=0.0, audio_end=4.0),
+        NarrationSegment(segment_id=1, voiceover='one', subtitle='one', recommended_clip_start=10.0, recommended_clip_end=20.0, audio_start=4.0, audio_end=8.0),
+        NarrationSegment(segment_id=3, voiceover='three', subtitle='three', recommended_clip_start=30.0, recommended_clip_end=40.0, audio_start=8.0, audio_end=12.0),
+    ]
+
+    ordered = _story_first_order_script(script)
+
+    assert [item.segment_id for item in ordered] == [1, 3, 2]
+
+
+def test_story_first_order_script_keeps_late_hook_at_audio_opening():
+    script = [
+        NarrationSegment(segment_id=2, voiceover='two', subtitle='two', recommended_clip_start=10.0, recommended_clip_end=20.0, audio_start=0.0, audio_end=4.0),
+        NarrationSegment(segment_id=1, voiceover='hook', subtitle='hook', recommended_clip_start=500.0, recommended_clip_end=510.0, audio_start=4.0, audio_end=8.0),
+        NarrationSegment(segment_id=3, voiceover='three', subtitle='three', recommended_clip_start=30.0, recommended_clip_end=40.0, audio_start=8.0, audio_end=12.0),
+    ]
+
+    ordered = _story_first_order_script(script)
+
+    assert [item.segment_id for item in ordered] == [1, 2, 3]
+
+
+def test_tts_generation_preserves_script_audio_order(monkeypatch, tmp_path):
+    import app.modules.renderer as renderer
+
+    def fake_synthesize(seg, out, voice, style):
+        out.write_text(str(seg.segment_id), encoding='utf-8')
+        return str(out)
+
+    monkeypatch.setattr(renderer, '_synthesize_segment', fake_synthesize)
+    monkeypatch.setattr(renderer, '_write_silence', lambda path, duration: path.write_text('pause', encoding='utf-8'))
+    monkeypatch.setattr(renderer, 'ffprobe_duration', lambda path: 1.0)
+    monkeypatch.setattr(renderer, 'concat_audios', lambda audio_paths, output_path: output_path)
+    script = [
+        NarrationSegment(segment_id=1, voiceover='hook', subtitle='hook', recommended_clip_start=500.0, recommended_clip_end=510.0),
+        NarrationSegment(segment_id=2, voiceover='first story beat', subtitle='first story beat', recommended_clip_start=10.0, recommended_clip_end=20.0),
+        NarrationSegment(segment_id=3, voiceover='second story beat', subtitle='second story beat', recommended_clip_start=30.0, recommended_clip_end=40.0),
+    ]
+    voice = VoiceProfile(
+        id='voice_default_female',
+        name='female',
+        voice_type=VoiceType.default_female,
+        model='mock',
+        voice_id='mock',
+    )
+
+    generated = generate_tts_and_subtitles(tmp_path, script, voice, 'auto')
+
+    assert [item.segment_id for item in generated] == [1, 2, 3]
+    assert [round(item.audio_start, 3) for item in generated] == [0.0, 1.45, 2.7]
+
+
+def test_humanlike_voice_pacing_gives_climax_and_reflection_room():
+    script = [
+        NarrationSegment(segment_id=idx, voiceover=str(idx), subtitle=str(idx), recommended_clip_start=idx * 10.0, recommended_clip_end=idx * 10.0 + 5.0, pause_after=0.2)
+        for idx in range(1, 11)
+    ]
+
+    _apply_humanlike_voice_pacing(script, get_settings())
+
+    assert script[0].editing_pace == 'fast'
+    assert script[8].pause_after >= get_settings().reflection_pause_after_min_seconds
+    assert script[9].pause_after >= get_settings().reflection_pause_after_min_seconds
+    assert script[7].pause_after >= get_settings().climax_pause_after_min_seconds
+
+
 def test_generate_srt_splits_long_voiceover_into_short_multiline_cues(tmp_path):
     script = [
         NarrationSegment(
@@ -106,6 +443,78 @@ def test_generate_srt_splits_long_voiceover_into_short_multiline_cues(tmp_path):
     for line in text.splitlines():
         if '-->' not in line and line and not line.isdigit():
             assert len(line) <= 36
+
+
+def test_subtitle_cues_use_text_weight_and_stay_inside_audio_window():
+    script = [
+        NarrationSegment(
+            segment_id=1,
+            voiceover='短。这里是一句明显更长的字幕内容，用来测试字幕显示时间是否更接近朗读节奏。',
+            subtitle='短。这里是一句明显更长的字幕内容，用来测试字幕显示时间是否更接近朗读节奏。',
+            recommended_clip_start=10.0,
+            recommended_clip_end=20.0,
+            audio_start=3.0,
+            audio_end=7.0,
+        )
+    ]
+
+    cues = _iter_subtitle_cues(script)
+    durations = [end - start for _, start, end, _ in cues]
+
+    assert cues[0][1] == 3.0
+    assert round(cues[-1][2], 3) == 7.0
+    assert all(3.0 <= start < end <= 7.0 for _, start, end, _ in cues)
+    assert max(durations) > min(durations)
+
+
+def test_legacy_workflow_uses_legacy_subtitle_timing(monkeypatch):
+    monkeypatch.setenv('LEGACY_WORKFLOW_ENABLED', 'true')
+    get_settings.cache_clear()
+    try:
+        script = [
+            NarrationSegment(
+                segment_id=1,
+                voiceover='第一句很短。第二句明显更长，用来确认旧字幕逻辑按块均分音频窗口。',
+                subtitle='第一句很短。第二句明显更长，用来确认旧字幕逻辑按块均分音频窗口。',
+                recommended_clip_start=10.0,
+                recommended_clip_end=20.0,
+                audio_start=3.0,
+                audio_end=7.0,
+            )
+        ]
+
+        cues = _iter_subtitle_cues(script)
+        durations = [round(end - start, 3) for _, start, end, _ in cues]
+
+        assert cues[0][1] == 3.0
+        assert round(cues[-1][2], 3) == 7.0
+        assert len(set(durations)) <= 2
+    finally:
+        get_settings.cache_clear()
+
+
+def test_legacy_subtitles_fall_back_to_voiceover_when_subtitle_is_truncated(monkeypatch):
+    monkeypatch.setenv('LEGACY_WORKFLOW_ENABLED', 'true')
+    get_settings.cache_clear()
+    try:
+        script = [
+            NarrationSegment(
+                segment_id=1,
+                voiceover='十二小时前，一个重达三百磅的胖子被迫吃下大量意大利面，直到胃部生生撑破。',
+                subtitle='十二小时前，一个重达三百磅的胖子被迫吃下大量意大利面，直到胃部生生撑',
+                recommended_clip_start=10.0,
+                recommended_clip_end=20.0,
+                audio_start=0.0,
+                audio_end=9.0,
+            )
+        ]
+
+        cues = _iter_subtitle_cues(script)
+        cue_text = ''.join(chunk.replace('\n', '') for _, _, _, chunk in cues)
+
+        assert '撑破' in cue_text
+    finally:
+        get_settings.cache_clear()
 
 
 def test_tts_instruction_uses_natural_paced_emotional_direction():
@@ -180,7 +589,7 @@ def test_generate_ass_writes_styled_subtitles_with_keyword_highlight(tmp_path):
     assert 'PlayResX: 1080' in text
     assert 'PlayResY: 1920' in text
     assert 'Style: Default' in text
-    assert ',2,70,70,230,1' in text
+    assert ',4.2,0.8,8,70,70,1320,1' in text
     assert 'Dialogue:' in text
     assert r'\N' in text
     assert r'{\c&H66D9FF&}鬼眼诅咒{\rDefault}' in text

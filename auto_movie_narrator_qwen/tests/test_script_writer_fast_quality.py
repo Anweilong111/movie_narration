@@ -1,11 +1,211 @@
 from __future__ import annotations
 
 from app.config import get_settings
-from app.models import SceneSummary, StoryEvent
-from app.modules.script_writer import build_evidence_narration_script
+from app.models import NarrationSegment, SceneSummary, StoryEvent
+from app.modules.script_writer import _apply_duration_budget, _normalize_segments, build_evidence_narration_script
 
 
 MECHANICAL_PHRASES = ('镜头给到', '镜头显示', '画面显示', '画面里', '对白点出', '字幕显示', '这一步的结果是')
+
+
+def test_normalize_segments_story_first_restores_timeline_order(monkeypatch):
+    monkeypatch.setenv('CLIP_STORY_FIRST_ENABLED', 'true')
+    monkeypatch.setenv('NARRATIVE_PRESERVE_MODEL_ORDER', 'true')
+    get_settings.cache_clear()
+    events = [
+        StoryEvent(event_id='E001', start_time=10.0, end_time=20.0, event='first event'),
+        StoryEvent(event_id='E002', start_time=50.0, end_time=60.0, event='second event'),
+    ]
+    segments = [
+        NarrationSegment(
+            segment_id=1,
+            voiceover='second',
+            subtitle='second',
+            source_event_ids=['E002'],
+            recommended_clip_start=50.0,
+            recommended_clip_end=60.0,
+        ),
+        NarrationSegment(
+            segment_id=2,
+            voiceover='first',
+            subtitle='first',
+            source_event_ids=['E001'],
+            recommended_clip_start=10.0,
+            recommended_clip_end=20.0,
+        ),
+    ]
+
+    normalized = _normalize_segments(segments, events)
+    get_settings.cache_clear()
+
+    assert [item.voiceover for item in normalized] == ['first。', 'second。']
+    assert [item.segment_id for item in normalized] == [1, 2]
+
+
+def test_normalize_segments_preserves_opening_hook_then_restores_story_order(monkeypatch):
+    monkeypatch.setenv('CLIP_STORY_FIRST_ENABLED', 'true')
+    monkeypatch.setenv('CLIP_OPENING_HOOK_ENABLED', 'true')
+    get_settings.cache_clear()
+    events = [
+        StoryEvent(event_id='E001', start_time=10.0, end_time=20.0, event='first event'),
+        StoryEvent(event_id='E002', start_time=50.0, end_time=60.0, event='second event'),
+        StoryEvent(event_id='E003', start_time=100.0, end_time=110.0, event='future event'),
+    ]
+    segments = [
+        NarrationSegment(
+            segment_id=1,
+            voiceover='future danger hook',
+            subtitle='future danger hook',
+            visual_intent='hook opening suspense',
+            editing_pace='fast',
+            source_event_ids=['E003'],
+            recommended_clip_start=100.0,
+            recommended_clip_end=110.0,
+        ),
+        NarrationSegment(
+            segment_id=2,
+            voiceover='second story beat',
+            subtitle='second story beat',
+            source_event_ids=['E002'],
+            recommended_clip_start=50.0,
+            recommended_clip_end=60.0,
+        ),
+        NarrationSegment(
+            segment_id=3,
+            voiceover='first story beat',
+            subtitle='first story beat',
+            source_event_ids=['E001'],
+            recommended_clip_start=10.0,
+            recommended_clip_end=20.0,
+        ),
+    ]
+
+    normalized = _normalize_segments(segments, events)
+    get_settings.cache_clear()
+
+    assert normalized[0].voiceover.startswith('future danger hook')
+    assert normalized[1].voiceover.startswith('first story beat')
+    assert normalized[2].voiceover.startswith('second story beat')
+
+
+def test_duration_budget_does_not_collapse_segments_to_same_voiceover(monkeypatch):
+    monkeypatch.setenv('NARRATIVE_DURATION_BUDGET_ENABLED', 'true')
+    monkeypatch.setenv('NARRATIVE_SEGMENT_MIN_CHARS', '24')
+    monkeypatch.setenv('NARRATIVE_SEGMENT_MAX_CHARS', '48')
+    monkeypatch.setenv('NARRATIVE_TARGET_CHARS_PER_SECOND', '1.0')
+    get_settings.cache_clear()
+    shared = 'same opening pressure, same opening pressure, same opening pressure, '
+    segments = [
+        NarrationSegment(
+            segment_id=1,
+            voiceover=shared + 'unique first ending about clue A.',
+            subtitle='',
+            source_event_ids=['E001'],
+            visual_evidence=['clue A on the table'],
+            transition='first transition',
+            recommended_clip_start=10.0,
+            recommended_clip_end=20.0,
+        ),
+        NarrationSegment(
+            segment_id=2,
+            voiceover=shared + 'unique second ending about clue B.',
+            subtitle='',
+            source_event_ids=['E002'],
+            visual_evidence=['clue B behind the door'],
+            transition='second transition',
+            recommended_clip_start=30.0,
+            recommended_clip_end=40.0,
+        ),
+        NarrationSegment(
+            segment_id=3,
+            voiceover=shared + 'unique third ending about clue C.',
+            subtitle='',
+            source_event_ids=['E003'],
+            visual_evidence=['clue C in the hallway'],
+            transition='third transition',
+            recommended_clip_start=50.0,
+            recommended_clip_end=60.0,
+        ),
+    ]
+
+    budgeted = _apply_duration_budget(segments, target_duration=30)
+    get_settings.cache_clear()
+
+    voiceovers = [item.voiceover for item in budgeted]
+    assert len(set(voiceovers)) == len(voiceovers)
+    assert [item.segment_id for item in budgeted] == [1, 2, 3]
+
+
+def test_duration_budget_does_not_trim_opening_hook(monkeypatch):
+    monkeypatch.setenv('CLIP_OPENING_HOOK_ENABLED', 'true')
+    get_settings.cache_clear()
+    hook_text = 'OPENING_HOOK_' + ('x' * 180)
+    segments = [
+        NarrationSegment(
+            segment_id=1,
+            voiceover=hook_text,
+            subtitle=hook_text,
+            visual_intent='hook opening suspense',
+            editing_pace='fast',
+            recommended_clip_start=100.0,
+            recommended_clip_end=110.0,
+        ),
+        NarrationSegment(
+            segment_id=2,
+            voiceover='story beat one. ' * 40,
+            subtitle='story beat one',
+            recommended_clip_start=10.0,
+            recommended_clip_end=20.0,
+        ),
+        NarrationSegment(
+            segment_id=3,
+            voiceover='story beat two. ' * 40,
+            subtitle='story beat two',
+            recommended_clip_start=50.0,
+            recommended_clip_end=60.0,
+        ),
+    ]
+
+    budgeted = _apply_duration_budget(segments, target_duration=60, style='horror')
+    get_settings.cache_clear()
+
+    assert budgeted[0].voiceover == hook_text
+    assert len(budgeted[1].voiceover) < len(segments[1].voiceover)
+    assert len(budgeted[2].voiceover) < len(segments[2].voiceover)
+
+
+def test_normalize_segments_cleans_evidence_artifacts_from_model_voiceover(monkeypatch):
+    monkeypatch.setenv('CLIP_STORY_FIRST_ENABLED', 'true')
+    get_settings.cache_clear()
+    events = [
+        StoryEvent(
+            event_id='E001',
+            start_time=10.0,
+            end_time=20.0,
+            event='侦探进入案发现场并发现墙上的线索',
+            visual_evidence=['12.0s: 中景，侦探查看墙上的线索'],
+            evidence_quotes=['Nothing has been touched.'],
+        )
+    ]
+    segments = [
+        NarrationSegment(
+            segment_id=1,
+            voiceover='侦探进入案发现场，有人说：“Nothing has been touched.”，12.0s:中景，侦探查看墙上的线索。',
+            subtitle='',
+            source_event_ids=['E001'],
+            recommended_clip_start=10.0,
+            recommended_clip_end=20.0,
+        )
+    ]
+
+    normalized = _normalize_segments(segments, events)
+    get_settings.cache_clear()
+
+    assert '有人说' not in normalized[0].voiceover
+    assert 'Nothing' not in normalized[0].voiceover
+    assert '12.0s' not in normalized[0].voiceover
+    assert '中景' not in normalized[0].voiceover
+    assert normalized[0].subtitle == normalized[0].voiceover
 
 
 def test_fast_evidence_script_filters_tail_teaser_and_cleans_visuals():

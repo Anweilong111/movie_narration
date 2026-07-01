@@ -7,9 +7,34 @@ from pathlib import Path
 
 
 def run_cmd(cmd: list[str]) -> None:
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    cmd = _noninteractive_ffmpeg_cmd(cmd)
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding='utf-8',
+        errors='replace',
+        stdin=subprocess.DEVNULL,
+    )
     if proc.returncode != 0:
         raise RuntimeError(f'Command failed: {" ".join(cmd)}\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}')
+
+
+def _noninteractive_ffmpeg_cmd(cmd: list[str]) -> list[str]:
+    if not cmd:
+        return cmd
+    executable = Path(cmd[0]).name.lower()
+    if executable.startswith('ffmpeg'):
+        updated = [cmd[0]]
+        if '-nostdin' not in cmd:
+            updated.append('-nostdin')
+        if '-hide_banner' not in cmd:
+            updated.append('-hide_banner')
+        if '-loglevel' not in cmd:
+            updated.extend(['-loglevel', 'error'])
+        updated.extend(cmd[1:])
+        return updated
+    return cmd
 
 
 def ffprobe_duration(path: str) -> float:
@@ -63,17 +88,32 @@ def ffprobe_info(path: str, output_json: str) -> dict:
     return data
 
 
-def extract_audio(video_path: str, output_wav: str) -> str:
-    Path(output_wav).parent.mkdir(parents=True, exist_ok=True)
+def extract_audio(video_path: str, output_audio: str) -> str:
+    Path(output_audio).parent.mkdir(parents=True, exist_ok=True)
     if ffprobe_has_audio(video_path):
-        run_cmd(['ffmpeg', '-y', '-i', video_path, '-vn', '-ac', '1', '-ar', '16000', output_wav])
+        suffix = Path(output_audio).suffix.lower()
+        if suffix == '.mp3':
+            run_cmd([
+                'ffmpeg', '-y', '-i', video_path,
+                '-vn', '-ac', '1', '-ar', '16000', '-b:a', '32k',
+                output_audio,
+            ])
+        else:
+            run_cmd(['ffmpeg', '-y', '-i', video_path, '-vn', '-ac', '1', '-ar', '16000', output_audio])
     else:
         duration = ffprobe_duration(video_path)
-        run_cmd([
-            'ffmpeg', '-y', '-f', 'lavfi', '-i', 'anullsrc=channel_layout=mono:sample_rate=16000',
-            '-t', f'{duration:.3f}', '-c:a', 'pcm_s16le', output_wav
-        ])
-    return output_wav
+        suffix = Path(output_audio).suffix.lower()
+        if suffix == '.mp3':
+            run_cmd([
+                'ffmpeg', '-y', '-f', 'lavfi', '-i', 'anullsrc=channel_layout=mono:sample_rate=16000',
+                '-t', f'{duration:.3f}', '-c:a', 'libmp3lame', '-b:a', '32k', output_audio
+            ])
+        else:
+            run_cmd([
+                'ffmpeg', '-y', '-f', 'lavfi', '-i', 'anullsrc=channel_layout=mono:sample_rate=16000',
+                '-t', f'{duration:.3f}', '-c:a', 'pcm_s16le', output_audio
+            ])
+    return output_audio
 
 
 def extract_keyframes(video_path: str, output_dir: str, fps: float = 0.2) -> list[str]:
@@ -132,6 +172,7 @@ def cut_clip(video_path: str, start: float, end: float, output_path: str, video_
             '-vf', 'setpts=PTS-STARTPTS',
             '-af', 'asetpts=PTS-STARTPTS',
             '-c:v', video_encoder,
+            '-ac', '2',
             '-c:a', 'aac',
             '-movflags', '+faststart',
             output_path,
@@ -161,7 +202,7 @@ def concat_videos(clip_paths: list[str], output_path: str, video_encoder: str = 
         concat_inputs = []
         for idx in range(len(clip_paths)):
             filters.append(f'[{idx}:v:0]setpts=PTS-STARTPTS[v{idx}]')
-            filters.append(f'[{idx}:a:0]asetpts=PTS-STARTPTS[a{idx}]')
+            filters.append(f'[{idx}:a:0]asetpts=PTS-STARTPTS,aformat=channel_layouts=stereo[a{idx}]')
             concat_inputs.append(f'[v{idx}][a{idx}]')
         filters.append(''.join(concat_inputs) + f'concat=n={len(clip_paths)}:v=1:a=1[v][a]')
         run_cmd([
@@ -183,6 +224,7 @@ def concat_videos(clip_paths: list[str], output_path: str, video_encoder: str = 
             '-safe', '0',
             '-i', str(concat_file),
             '-c:v', video_encoder,
+            '-ac', '2',
             '-c:a', 'aac',
             '-movflags', '+faststart',
             output_path,
@@ -208,7 +250,29 @@ def concat_audios(audio_paths: list[str], output_path: str) -> str:
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     concat_file = Path(output_path).with_suffix('.concat.txt')
     concat_file.write_text('\n'.join([f"file '{Path(p).resolve()}'" for p in audio_paths]), encoding='utf-8')
-    run_cmd(['ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', str(concat_file), '-c:a', 'aac', output_path])
+    suffix = Path(output_path).suffix.lower()
+    if suffix == '.wav':
+        run_cmd([
+            'ffmpeg', '-y',
+            '-f', 'concat',
+            '-safe', '0',
+            '-i', str(concat_file),
+            '-ac', '1',
+            '-ar', '24000',
+            '-c:a', 'pcm_s16le',
+            output_path,
+        ])
+    else:
+        run_cmd([
+            'ffmpeg', '-y',
+            '-f', 'concat',
+            '-safe', '0',
+            '-i', str(concat_file),
+            '-ac', '1',
+            '-ar', '24000',
+            '-c:a', 'aac',
+            output_path,
+        ])
     return output_path
 
 
@@ -235,7 +299,7 @@ def render_final(
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     video_duration = ffprobe_duration(cut_video)
     voice_duration = ffprobe_duration(voice_audio)
-    duration = max(video_duration, voice_duration)
+    duration = voice_duration
     stop_duration = max(0.0, duration - video_duration)
     video_filter = _final_video_filter(
         subtitle_srt,
@@ -263,7 +327,8 @@ def render_final(
             '-c:v', video_encoder, '-c:a', 'aac', output_path
         ])
     else:
-        mix_filter = _mixed_audio_filter(loudnorm_enabled, loudnorm_i, loudnorm_tp, loudnorm_lra)
+        # A pure silent placeholder can make loudnorm emit NaN on newer FFmpeg builds.
+        mix_filter = _mixed_audio_filter(False, loudnorm_i, loudnorm_tp, loudnorm_lra)
         filter_complex = (
             f'[2:a]volume=0.0,apad,atrim=0:{duration:.3f}[a0];'
             f'[1:a]volume={_clamp_volume(narration_volume):.4f},apad,atrim=0:{duration:.3f}[a1];'
@@ -354,8 +419,18 @@ def _final_video_filter(
             vertical_background=vertical_background,
             blur_sigma=vertical_blur_sigma,
         ))
-    filters.append(f'subtitles={subtitle_path}')
+    filters.append(f'subtitles={_subtitle_filter_path(subtitle_path)}')
     return ','.join(filters)
+
+
+def _subtitle_filter_path(subtitle_path: str) -> str:
+    path = Path(subtitle_path).resolve().as_posix()
+    path = path.replace('\\', '/')
+    path = path.replace(':', r'\:')
+    path = path.replace("'", r"\'")
+    path = path.replace(',', r'\,')
+    path = path.replace('[', r'\[').replace(']', r'\]')
+    return f"'{path}'"
 
 
 def _vertical_canvas_filter(

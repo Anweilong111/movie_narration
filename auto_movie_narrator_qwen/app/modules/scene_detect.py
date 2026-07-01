@@ -18,6 +18,7 @@ def detect_scenes(
     transnetv2_min_shot_seconds: float = 0.75,
     transnetv2_target_scene_seconds: float = 24.0,
     transnetv2_max_scene_seconds: float = 48.0,
+    allow_fallback: bool = False,
 ) -> list[Scene]:
     if detector.strip().lower() in {'transnetv2', 'shot', 'shot_boundary'}:
         try:
@@ -30,6 +31,14 @@ def detect_scenes(
                 max_scene_seconds=transnetv2_max_scene_seconds,
             )
         except Exception as exc:
+            if not allow_fallback:
+                _save_scene_detection_meta(output_json, {
+                    'detector': 'transnetv2',
+                    'status': 'failed',
+                    'reason': str(exc),
+                    'fallback': None,
+                })
+                raise
             _save_scene_detection_meta(output_json, {
                 'detector': 'transnetv2',
                 'status': 'fallback',

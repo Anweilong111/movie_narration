@@ -70,17 +70,20 @@ def generate_narration_script(
         segments = build_evidence_narration_script(
             story_events, target_duration, desired_segments, scene_summaries, style, director_plan
         )
+        segments = _apply_duration_budget(segments, target_duration, style, director_plan)
         save_json(output_json, segments)
         return segments
     if len(story_events) > 35 and not force_model_script:
         segments = build_evidence_narration_script(
             story_events, target_duration, desired_segments, scene_summaries, style, director_plan
         )
+        segments = _apply_duration_budget(segments, target_duration, style, director_plan)
         save_json(output_json, segments)
         return segments
     if client.mock:
         segments = []
         for i, e in enumerate(story_events[:desired_segments], 1):
+            visual_plan = _visual_plan_for_segment(e, i, desired_segments, i == desired_segments, style)
             segments.append(NarrationSegment(
                 segment_id=i,
                 voiceover=_fallback_voiceover(e, i),
@@ -89,19 +92,25 @@ def generate_narration_script(
                 speed='slow',
                 source_event_ids=[e.event_id],
                 evidence_quotes=e.evidence_quotes[:2],
-                visual_evidence=e.visual_evidence[:2],
+                visual_evidence=_clean_visual_list(e.visual_evidence[:2]),
                 transition=e.transition_hint,
+                visual_intent=visual_plan['visual_intent'],
+                preferred_visual_function=visual_plan['preferred_visual_function'],
+                editing_pace=visual_plan['editing_pace'],
+                must_show=visual_plan['must_show'],
+                avoid_visuals=visual_plan['avoid_visuals'],
                 recommended_clip_start=e.start_time,
                 recommended_clip_end=e.end_time,
                 expected_duration=target_duration / max(desired_segments, 1),
             ))
+        segments = _apply_duration_budget(segments, target_duration, style, director_plan)
         save_json(output_json, segments)
         return segments
 
     prompt_events = _select_prompt_events(story_events, max(desired_segments + 10, 28))
     compact_events = [_compact_story_event(e) for e in prompt_events]
     compact_scenes = [_compact_scene_summary(s) for s in _select_prompt_scenes(scene_summaries or [], prompt_events, 32)]
-    target_chars = _target_total_chars(target_duration)
+    target_chars = _target_total_chars(target_duration, style, director_plan)
     compact_director_plan = _compact_director_plan(director_plan or {})
     prompt = f"""
 你是专业中文影视解说编导。生成 {target_duration} 秒影视解说稿。
@@ -119,7 +128,8 @@ def generate_narration_script(
 10. 严禁重复固定句式，尤其不要反复使用“线索在逼近”“危险没有结束”“更深的秘密”等模板句。
 11. 不得编造输入中没有的人物、动作、结果。
 12. 优先遵循 director_plan 的开头钩子、情绪曲线和结尾余味，但所有表达必须回到 story_events 与 scene_evidence 的事实。
-输出 JSON 数组，字段：segment_id,voiceover,subtitle,emotion,speed,pause_after,source_event_ids,evidence_quotes,visual_evidence,transition,recommended_clip_start,recommended_clip_end,expected_duration。
+13. 每段必须写清楚 visual_intent 和 preferred_visual_function，让剪辑器知道这段旁白为什么需要这个画面。
+输出 JSON 数组，字段：segment_id,voiceover,subtitle,emotion,speed,pause_after,source_event_ids,evidence_quotes,visual_evidence,transition,visual_intent,preferred_visual_function,editing_pace,must_show,avoid_visuals,recommended_clip_start,recommended_clip_end,expected_duration。
 
 storyline:{storyline}
 story_events:{compact_events}
@@ -133,6 +143,7 @@ director_plan:{compact_director_plan}
         segments = build_evidence_narration_script(
             story_events, target_duration, desired_segments, scene_summaries, style, director_plan
         )
+        segments = _apply_duration_budget(segments, target_duration, style, director_plan)
         save_json(output_json, segments)
         return segments
     segments = [
@@ -141,6 +152,7 @@ director_plan:{compact_director_plan}
     ]
     segments = _ensure_target_segments(segments, prompt_events, target_duration)
     segments = _normalize_segments(segments, story_events)
+    segments = _apply_duration_budget(segments, target_duration, style, director_plan)
     save_json(output_json, segments)
     return segments
 
@@ -174,6 +186,7 @@ def build_evidence_narration_script(
             source_event_ids = [item.event_id for item in selected_events[-3:]]
             event = _best_final_visual_event(selected_events, scene_summaries or [])
             clip_start, clip_end = _recommended_clip_window(event, scene_summaries or [])
+        visual_plan = _visual_plan_for_segment(event, idx, len(selected_events), is_final, style)
         default_emotion = _emotion_for_event(event, idx, len(selected_events), is_final, style)
         default_speed = _speed_for_event(event, idx, len(selected_events), is_final, style)
         default_pause = _pause_after_for_event(event, idx, len(selected_events), is_final, style)
@@ -186,13 +199,18 @@ def build_evidence_narration_script(
             pause_after=_director_pause_for_position(director_plan, idx, len(selected_events)) or default_pause,
             source_event_ids=source_event_ids,
             evidence_quotes=_sanitize_cross_movie_list(event.evidence_quotes[:2], director_plan),
-            visual_evidence=_sanitize_cross_movie_list(event.visual_evidence[:2], director_plan),
+            visual_evidence=_clean_visual_list(_sanitize_cross_movie_list(event.visual_evidence[:2], director_plan)),
             transition=_sanitize_cross_movie_terms(event.transition_hint, director_plan),
+            visual_intent=visual_plan['visual_intent'],
+            preferred_visual_function=visual_plan['preferred_visual_function'],
+            editing_pace=visual_plan['editing_pace'],
+            must_show=visual_plan['must_show'],
+            avoid_visuals=visual_plan['avoid_visuals'],
             recommended_clip_start=clip_start,
             recommended_clip_end=clip_end,
             expected_duration=target_duration / max(desired_segments, 1),
         ))
-    return _normalize_segments(segments, story_events)
+    return _apply_duration_budget(_normalize_segments(segments, story_events), target_duration, style, director_plan)
 
 
 def _evidence_voiceover(
@@ -566,7 +584,7 @@ def _sanitize_cross_movie_terms(text: str, director_plan: dict[str, Any] | None)
 
 
 def _sanitize_narration_text(text: str, director_plan: dict[str, Any] | None) -> str:
-    text = _sanitize_cross_movie_terms(text, director_plan)
+    text = _clean_generated_voiceover_artifacts(_sanitize_cross_movie_terms(text, director_plan))
     clauses = []
     for clause in _split_clauses(text):
         cleaned = clause.strip(' “”，,;；')
@@ -1279,7 +1297,7 @@ def _ensure_target_segments(segments: list[NarrationSegment], story_events: list
             pause_after=0.35,
             source_event_ids=[event.event_id],
             evidence_quotes=event.evidence_quotes[:2],
-            visual_evidence=event.visual_evidence[:2],
+            visual_evidence=_clean_visual_list(event.visual_evidence[:2]),
             transition=event.transition_hint,
             recommended_clip_start=event.start_time,
             recommended_clip_end=max(event.end_time, event.start_time + 4.0),
@@ -1291,7 +1309,7 @@ def _ensure_target_segments(segments: list[NarrationSegment], story_events: list
 
 def _fallback_voiceover(event: StoryEvent, idx: int) -> str:
     quote = f'有人说：“{event.evidence_quotes[0]}”' if event.evidence_quotes else ''
-    visual = event.visual_evidence[0] if event.visual_evidence else ''
+    visual = _clean_visual(event.visual_evidence[0]) if event.visual_evidence else ''
     transition = event.transition_hint or '这一步把前面的疑问继续推向下一处险境。'
     pieces = [
         event.event,
@@ -1301,6 +1319,94 @@ def _fallback_voiceover(event: StoryEvent, idx: int) -> str:
     ]
     text = '。'.join(piece.strip('。') for piece in pieces if piece.strip())
     return text + ('。' if text and not text.endswith('。') else '')
+
+
+def _visual_plan_for_segment(
+    event: StoryEvent | None,
+    idx: int,
+    total: int,
+    is_final: bool,
+    style: str = '',
+) -> dict[str, Any]:
+    event_text = _event_signal_text(event) if event else ''
+    style_text = style or ''
+    avoid = ['黑屏', '片头字幕', '演职员表', '水印广告', '低清晰度画面']
+    must_show = _visual_must_show(event_text, event)
+
+    if idx == 1:
+        return {
+            'visual_intent': '开头制造悬念，先给观众一个强视觉钩子',
+            'preferred_visual_function': '反应镜头' if '都市' in style_text or '短剧' in style_text else '动作镜头',
+            'editing_pace': 'fast',
+            'must_show': must_show,
+            'avoid_visuals': avoid + ['纯对白镜头'],
+        }
+    if is_final or idx >= max(1, total - 1):
+        return {
+            'visual_intent': '情绪留白并回扣主题',
+            'preferred_visual_function': '环境空镜' if not any(word in event_text for word in ('哭', '崩溃', '牺牲')) else '人物特写',
+            'editing_pace': 'slow',
+            'must_show': must_show,
+            'avoid_visuals': avoid + ['高频动作镜头'],
+        }
+    if any(word in event_text for word in ('真相', '证据', '线索', '钥匙', '照片', '合同', '地图', '文件', '录音', '戒指')):
+        return {
+            'visual_intent': '解释线索，让观众看清关键证据',
+            'preferred_visual_function': '证据镜头',
+            'editing_pace': 'medium',
+            'must_show': must_show,
+            'avoid_visuals': avoid + ['无关环境空镜'],
+        }
+    if any(word in event_text for word in ('争吵', '对峙', '摊牌', '冲突', '威胁', '背叛', '误会', '羞辱')):
+        return {
+            'visual_intent': '强化人物冲突和反应',
+            'preferred_visual_function': '反应镜头',
+            'editing_pace': 'fast',
+            'must_show': must_show,
+            'avoid_visuals': avoid + ['远景空镜'],
+        }
+    if any(word in event_text for word in ('逃', '追', '打', '爆炸', '坠落', '袭击', '奔跑', '塌', '救')):
+        return {
+            'visual_intent': '推动危机节奏，让画面跟上动作压力',
+            'preferred_visual_function': '动作镜头',
+            'editing_pace': 'fast',
+            'must_show': must_show,
+            'avoid_visuals': avoid + ['静态对白'],
+        }
+    if any(word in event_text for word in ('孤独', '沉默', '低头', '哭', '眼泪', '告别', '牺牲', '亲情', '爱情')):
+        return {
+            'visual_intent': '承载人物情绪和内心变化',
+            'preferred_visual_function': '人物特写',
+            'editing_pace': 'slow',
+            'must_show': must_show,
+            'avoid_visuals': avoid + ['纯动作镜头'],
+        }
+    return {
+        'visual_intent': '承接剧情信息并保持叙事连续',
+        'preferred_visual_function': '人物特写' if must_show else '转场镜头',
+        'editing_pace': 'medium',
+        'must_show': must_show,
+        'avoid_visuals': avoid,
+    }
+
+
+def _visual_must_show(event_text: str, event: StoryEvent | None) -> list[str]:
+    result: list[str] = []
+    if event:
+        result.extend([name for name in event.characters[:2] if name and name.lower() not in {'unknown', '未知'}])
+    for keyword in ('真相', '证据', '线索', '照片', '合同', '地图', '戒指', '怪物', '尸体', '雪山', '诅咒', '钥匙'):
+        if keyword in event_text:
+            result.append(keyword)
+    return _unique(result)[:4]
+
+
+def _coerce_editing_pace(value: Any) -> str:
+    text = str(value or '').strip().lower()
+    if text in {'fast', '快', '紧凑', '快速'}:
+        return 'fast'
+    if text in {'slow', '慢', '留白', '舒缓'}:
+        return 'slow'
+    return 'medium'
 
 
 def _coerce_narration_segment(item: Any, idx: int, story_events: list[StoryEvent]) -> dict[str, Any]:
@@ -1320,8 +1426,16 @@ def _coerce_narration_segment(item: Any, idx: int, story_events: list[StoryEvent
     data['pause_after'] = float(data.get('pause_after') if data.get('pause_after') is not None else 0.25)
     data['source_event_ids'] = _coerce_str_list(data.get('source_event_ids')) or ([fallback_event.event_id] if fallback_event else [])
     data['evidence_quotes'] = _coerce_str_list(data.get('evidence_quotes')) or (fallback_event.evidence_quotes[:2] if fallback_event else [])
-    data['visual_evidence'] = _coerce_str_list(data.get('visual_evidence')) or (fallback_event.visual_evidence[:2] if fallback_event else [])
+    data['visual_evidence'] = _clean_visual_list(
+        _coerce_str_list(data.get('visual_evidence')) or (fallback_event.visual_evidence[:2] if fallback_event else [])
+    )
     data['transition'] = str(data.get('transition') or (fallback_event.transition_hint if fallback_event else '')).strip()
+    visual_plan = _visual_plan_for_segment(fallback_event, idx, max(idx, len(story_events)), False, '') if fallback_event else {}
+    data['visual_intent'] = str(data.get('visual_intent') or visual_plan.get('visual_intent') or '').strip()
+    data['preferred_visual_function'] = str(data.get('preferred_visual_function') or visual_plan.get('preferred_visual_function') or '').strip()
+    data['editing_pace'] = _coerce_editing_pace(data.get('editing_pace') or visual_plan.get('editing_pace'))
+    data['must_show'] = _coerce_str_list(data.get('must_show')) or visual_plan.get('must_show', [])
+    data['avoid_visuals'] = _coerce_str_list(data.get('avoid_visuals')) or visual_plan.get('avoid_visuals', [])
     data['recommended_clip_start'] = float(data.get('recommended_clip_start') if data.get('recommended_clip_start') is not None else fallback_start)
     data['recommended_clip_end'] = float(data.get('recommended_clip_end') if data.get('recommended_clip_end') is not None else fallback_end)
     if data['recommended_clip_end'] < data['recommended_clip_start']:
@@ -1338,7 +1452,7 @@ def _compact_story_event(event: StoryEvent) -> dict[str, Any]:
         'end_time': round(event.end_time, 2),
         'event': event.event[:130],
         'evidence_quotes': [quote[:75] for quote in event.evidence_quotes[:2]],
-        'visual_evidence': [item[:85] for item in event.visual_evidence[:2]],
+        'visual_evidence': [cleaned[:85] for item in event.visual_evidence[:2] if (cleaned := _clean_visual(item))],
         'transition_hint': event.transition_hint[:70],
         'importance': event.importance,
     }
@@ -1350,7 +1464,7 @@ def _compact_scene_summary(scene: SceneSummary) -> dict[str, Any]:
         'start': round(scene.start, 2),
         'end': round(scene.end, 2),
         'keyframe_times': [round(t, 2) for t in scene.keyframe_times[:5]],
-        'frame_observations': [item[:70] for item in scene.frame_observations[:2]],
+        'frame_observations': [cleaned[:70] for item in scene.frame_observations[:2] if (cleaned := _clean_visual(item))],
         'dialogue_summary': scene.dialogue_summary[:90],
         'evidence_quotes': [quote[:70] for quote in scene.evidence_quotes[:2]],
         'events': [event[:80] for event in scene.events[:2]],
@@ -1422,8 +1536,256 @@ def _scene_event_text(scene: SceneSummary) -> str:
     return ''
 
 
-def _target_total_chars(target_duration: int) -> int:
-    return max(450, int(target_duration * 5.5))
+def _target_total_chars(
+    target_duration: int,
+    style: str = '',
+    director_plan: dict[str, Any] | None = None,
+) -> int:
+    settings = get_settings()
+    duration = max(60, int(target_duration or 0))
+    return max(450, int(duration * _duration_budget_chars_per_second(style, director_plan)))
+
+
+def _duration_budget_chars_per_second(style: str, director_plan: dict[str, Any] | None = None) -> float:
+    settings = get_settings()
+    profile_text = _duration_budget_profile_text(style, director_plan)
+    horror_terms = (
+        'horror',
+        'thriller',
+        'suspense',
+        '\u6050\u6016',
+        '\u60ac\u7591',
+        '\u60ca\u609a',
+        '\u7075\u5f02',
+        '\u538b\u6291',
+    )
+    action_terms = (
+        'action',
+        '\u52a8\u4f5c',
+        '\u6253\u6597',
+        '\u8ffd\u9010',
+        '\u7206\u70b9',
+        '\u707e\u96be',
+    )
+    comedy_terms = (
+        'comedy',
+        '\u559c\u5267',
+        '\u641e\u7b11',
+        '\u90fd\u5e02',
+        '\u723d\u7247',
+    )
+    if any(term in profile_text for term in horror_terms):
+        return settings.narrative_horror_chars_per_second
+    if any(term in profile_text for term in action_terms):
+        return settings.narrative_action_chars_per_second
+    if any(term in profile_text for term in comedy_terms):
+        return settings.narrative_comedy_chars_per_second
+    return settings.narrative_target_chars_per_second
+
+
+def _duration_budget_profile_text(style: str, director_plan: dict[str, Any] | None = None) -> str:
+    plan = _dict_like(director_plan)
+    parts: list[str] = [str(style or '')]
+    for key in ('recommended_style', 'movie_theme', 'core_conflict', 'opening_hook_direction'):
+        parts.append(str(plan.get(key) or ''))
+    curve = plan.get('emotion_curve')
+    if isinstance(curve, list):
+        for item in curve:
+            phase = _dict_like(item)
+            parts.extend(str(phase.get(key) or '') for key in ('phase', 'emotion', 'goal'))
+    return ' '.join(parts).lower()
+
+
+def _apply_duration_budget(
+    segments: list[NarrationSegment],
+    target_duration: int,
+    style: str = '',
+    director_plan: dict[str, Any] | None = None,
+) -> list[NarrationSegment]:
+    settings = get_settings()
+    if not settings.narrative_duration_budget_enabled or target_duration <= 0 or not segments:
+        return segments
+    target_chars = _target_total_chars(target_duration, style, director_plan)
+    hard_max = max(target_chars, int(target_chars * max(1.0, settings.narrative_duration_budget_hard_multiplier)))
+    if _segments_text_chars(segments) <= hard_max:
+        return _rebalance_segment_durations(segments, target_duration)
+
+    budgeted = [seg.model_copy(deep=True) for seg in segments]
+    preserve_opening_hook = _should_preserve_opening_hook(budgeted)
+    for idx, seg in enumerate(budgeted, 1):
+        if preserve_opening_hook and idx == 1:
+            continue
+        limit = _duration_budget_segment_limit(seg, hard_max, len(budgeted), idx)
+        seg.voiceover = _compress_narration_to_limit(seg.voiceover, limit, keep_tail=idx == len(budgeted))
+        seg.subtitle = _subtitle_from_voiceover(seg.voiceover)
+        seg.transition = _compress_narration_to_limit(
+            seg.transition,
+            max(18, min(46, limit // 2)),
+            keep_tail=False,
+        )
+
+    current = _segments_text_chars(budgeted)
+    if current > hard_max:
+        protected_chars = _text_chars(budgeted[0].voiceover) if preserve_opening_hook and budgeted else 0
+        compressible_chars = max(1, current - protected_chars)
+        remaining_budget = max(1, hard_max - protected_chars)
+        ratio = max(0.45, min(1.0, remaining_budget / compressible_chars))
+        for idx, seg in enumerate(budgeted, 1):
+            if preserve_opening_hook and idx == 1:
+                continue
+            limit = max(settings.narrative_segment_min_chars, int(_text_chars(seg.voiceover) * ratio * 0.98))
+            seg.voiceover = _compress_narration_to_limit(seg.voiceover, limit, keep_tail=idx == len(budgeted))
+            seg.subtitle = _subtitle_from_voiceover(seg.voiceover)
+    budgeted = _repair_duplicate_budget_voiceovers(budgeted, segments, hard_max)
+    return _rebalance_segment_durations(budgeted, target_duration)
+
+
+def _rebalance_segment_durations(segments: list[NarrationSegment], target_duration: int) -> list[NarrationSegment]:
+    if not segments or target_duration <= 0:
+        return segments
+    expected = target_duration / max(len(segments), 1)
+    for seg in segments:
+        seg.expected_duration = expected
+    return segments
+
+
+def _duration_budget_segment_limit(
+    seg: NarrationSegment,
+    hard_max: int,
+    total: int,
+    idx: int,
+) -> int:
+    settings = get_settings()
+    base = int(hard_max / max(total, 1))
+    pace = str(seg.editing_pace or seg.speed or '').lower()
+    if idx == 1:
+        base += 8
+    if idx == total:
+        base += 10
+    if 'fast' in pace:
+        base += 8
+    if 'slow' in pace:
+        base -= 8
+    return max(settings.narrative_segment_min_chars, min(settings.narrative_segment_max_chars, base))
+
+
+def _repair_duplicate_budget_voiceovers(
+    budgeted: list[NarrationSegment],
+    original: list[NarrationSegment],
+    hard_max: int,
+) -> list[NarrationSegment]:
+    if len(budgeted) <= 1:
+        return budgeted
+    repaired = [seg.model_copy(deep=True) for seg in budgeted]
+    seen: dict[str, int] = {}
+    total = len(repaired)
+    for idx, seg in enumerate(repaired, 1):
+        key = _voiceover_repeat_key(seg.voiceover)
+        if not key:
+            continue
+        if key in seen:
+            original_seg = original[idx - 1] if idx - 1 < len(original) else seg
+            limit = _duration_budget_segment_limit(seg, hard_max, total, idx)
+            for source_text in _duplicate_repair_sources(original_seg, seg):
+                candidate = _compress_narration_to_limit(source_text, limit, keep_tail=True)
+                candidate_key = _voiceover_repeat_key(candidate)
+                if candidate_key and candidate_key not in seen:
+                    seg.voiceover = candidate
+                    seg.subtitle = _subtitle_from_voiceover(candidate)
+                    key = candidate_key
+                    break
+        seen[key] = idx
+    return repaired
+
+
+def _duplicate_repair_sources(original: NarrationSegment, current: NarrationSegment) -> list[str]:
+    sources = [
+        original.voiceover,
+        '. '.join(item for item in [
+            original.voiceover,
+            original.transition,
+            '. '.join(_clean_visual_list(original.visual_evidence[:2])),
+            '. '.join(original.evidence_quotes[:1]),
+        ] if item),
+        '. '.join(item for item in [
+            current.transition,
+            '. '.join(_clean_visual_list(current.visual_evidence[:2])),
+            '. '.join(current.evidence_quotes[:1]),
+            current.voiceover,
+        ] if item),
+    ]
+    result = []
+    seen = set()
+    for source in sources:
+        text = str(source or '').strip()
+        if text and text not in seen:
+            result.append(text)
+            seen.add(text)
+    return result
+
+
+def _voiceover_repeat_key(text: str) -> str:
+    return re.sub(r'[\s\u3000\u3002\uff0c\uff01\uff1f\uff1b,;.!?:"\'\u201c\u201d\u2018\u2019]+', '', str(text or '')).lower()
+
+
+def _compress_narration_to_limit(text: str, limit: int, keep_tail: bool = False) -> str:
+    text = _clean_generated_voiceover_artifacts(str(text or ''))
+    text = re.sub(r'\s+', '', text.strip())
+    if not text or _text_chars(text) <= limit:
+        return text
+    clauses = [item.strip() for item in re.split(r'[\u3002\uff01\uff1f\uff1b\uff0c,;!?]+', text) if item.strip()]
+    if not clauses:
+        return _hard_truncate_text(text, limit)
+
+    tail = ''
+    source_clauses = clauses
+    if keep_tail and len(clauses) > 1:
+        tail_limit = max(14, min(limit // 2, limit - 10))
+        tail = _hard_truncate_text(clauses[-1], tail_limit).rstrip('\u3002\uff01\uff1f,;!')
+        source_clauses = clauses[:-1]
+
+    kept: list[str] = []
+    for clause in source_clauses:
+        candidate = _join_budget_clauses(kept + [clause], tail)
+        if _text_chars(candidate) <= limit:
+            kept.append(clause)
+        elif not kept:
+            first_limit = max(12, limit - (_text_chars(tail) + 1 if tail else 0))
+            kept.append(_hard_truncate_text(clause, first_limit).rstrip('\u3002\uff01\uff1f,;!'))
+            break
+
+    result = _join_budget_clauses(kept, tail)
+    if _text_chars(result) > limit:
+        result = _hard_truncate_text(result, limit)
+    return result
+
+
+def _join_budget_clauses(clauses: list[str], tail: str = '') -> str:
+    punctuation = '\u3002'
+    separator = '\uff0c'
+    parts = [item.strip().strip('\u3002\uff01\uff1f,;!') for item in clauses if item.strip()]
+    if tail and tail.strip() not in parts:
+        parts.append(tail.strip().strip('\u3002\uff01\uff1f,;!'))
+    if not parts:
+        return tail.strip() if tail else ''
+    return separator.join(parts).rstrip('\u3002\uff01\uff1f,;!') + punctuation
+
+
+def _hard_truncate_text(text: str, limit: int) -> str:
+    text = str(text or '').strip()
+    if _text_chars(text) <= limit:
+        return text
+    if limit <= 4:
+        return text[:limit]
+    return text[: max(1, limit - 1)].rstrip('\u3002\uff01\uff1f,;!,') + '\u2026'
+
+
+def _segments_text_chars(segments: list[NarrationSegment]) -> int:
+    return sum(_text_chars(seg.voiceover) for seg in segments)
+
+
+def _text_chars(text: str) -> int:
+    return len(re.sub(r'\s+', '', str(text or '')))
 
 
 def _subtitle_from_voiceover(text: str) -> str:
@@ -1598,6 +1960,15 @@ def _clean_visual(text: str) -> str:
     return text[:70]
 
 
+def _clean_visual_list(items: list[str] | tuple[str, ...]) -> list[str]:
+    cleaned: list[str] = []
+    for item in items or []:
+        text = _clean_visual(str(item or ''))
+        if text and text not in cleaned:
+            cleaned.append(text)
+    return cleaned
+
+
 def _limit_text(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
@@ -1676,26 +2047,90 @@ def _normalize_segments(segments: list[NarrationSegment], story_events: list[Sto
                 seg.visual_evidence = _unique([item for event in source_events for item in event.visual_evidence])[:3]
             if not seg.transition:
                 seg.transition = source_events[-1].transition_hint
-        seg.voiceover = _strip_repeated_clauses(seg.voiceover)
+        seg.voiceover = _clean_generated_voiceover_artifacts(_strip_repeated_clauses(seg.voiceover))
         seg.subtitle = seg.subtitle or seg.voiceover
         normalized.append(seg)
 
-    final_segments = [seg for seg in normalized if _is_final_recap_segment(seg)]
-    regular_segments = [seg for seg in normalized if not _is_final_recap_segment(seg)]
-    if get_settings().narrative_preserve_model_order:
+    opening_hook = normalized[0] if _should_preserve_opening_hook(normalized) else None
+    sortable_segments = normalized[1:] if opening_hook else normalized
+    final_segments = [seg for seg in sortable_segments if _is_final_recap_segment(seg)]
+    regular_segments = [seg for seg in sortable_segments if not _is_final_recap_segment(seg)]
+    settings = get_settings()
+    if settings.clip_story_first_enabled:
+        normalized = _story_timeline_order(regular_segments)
+        normalized.extend(_story_timeline_order(final_segments))
+    elif settings.narrative_preserve_model_order:
         normalized = regular_segments + final_segments
     else:
-        normalized = sorted(regular_segments, key=lambda item: (item.recommended_clip_start, item.recommended_clip_end, item.segment_id))
-        normalized.extend(sorted(final_segments, key=lambda item: (item.recommended_clip_start, item.recommended_clip_end, item.segment_id)))
+        normalized = _story_timeline_order(regular_segments)
+        normalized.extend(_story_timeline_order(final_segments))
+    if opening_hook:
+        normalized = [opening_hook] + normalized
     seen_clauses: dict[str, int] = {}
     for idx, seg in enumerate(normalized, 1):
         seg.segment_id = idx
         source_events = [event_map[eid] for eid in seg.source_event_ids if eid in event_map]
         if source_events and _has_mechanical_narration_language(seg.voiceover):
             seg.voiceover = _evidence_voiceover(source_events[-1], idx, len(normalized))
-        seg.voiceover = _remove_overused_clauses(seg.voiceover, seen_clauses)
+        if source_events:
+            _apply_visual_plan_defaults(seg, source_events[-1], idx, len(normalized))
+        seg.voiceover = _remove_overused_clauses(
+            _repair_incomplete_generated_voiceover(
+                _clean_generated_voiceover_artifacts(seg.voiceover),
+                source_events[-1] if source_events else None,
+                idx,
+                len(normalized),
+            ),
+            seen_clauses,
+        )
         seg.subtitle = seg.voiceover
     return normalized
+
+
+def _story_timeline_order(segments: list[NarrationSegment]) -> list[NarrationSegment]:
+    return sorted(
+        segments,
+        key=lambda item: (item.recommended_clip_start, item.recommended_clip_end, item.segment_id),
+    )
+
+
+def _should_preserve_opening_hook(segments: list[NarrationSegment]) -> bool:
+    if len(segments) <= 1 or not get_settings().clip_opening_hook_enabled:
+        return False
+    return _is_opening_hook_segment(segments[0])
+
+
+def _is_opening_hook_segment(seg: NarrationSegment) -> bool:
+    text = ' '.join([
+        str(seg.visual_intent or ''),
+        str(seg.preferred_visual_function or ''),
+        str(seg.editing_pace or ''),
+        str(seg.voiceover or ''),
+    ]).lower()
+    hook_terms = (
+        'hook',
+        'opening',
+        '\u5f00\u5934',
+        '\u94a9\u5b50',
+        '\u60ac\u5ff5',
+        '\u5438\u5f15',
+        '\u5f3a\u89c6\u89c9',
+        '\u5f3a\u51b2\u7a81',
+    )
+    return any(term in text for term in hook_terms)
+
+
+def _apply_visual_plan_defaults(seg: NarrationSegment, event: StoryEvent, idx: int, total: int) -> None:
+    plan = _visual_plan_for_segment(event, idx, total, idx == total, '')
+    if not seg.visual_intent:
+        seg.visual_intent = plan['visual_intent']
+    if not seg.preferred_visual_function:
+        seg.preferred_visual_function = plan['preferred_visual_function']
+    seg.editing_pace = _coerce_editing_pace(seg.editing_pace or plan['editing_pace'])
+    if not seg.must_show:
+        seg.must_show = plan['must_show']
+    if not seg.avoid_visuals:
+        seg.avoid_visuals = plan['avoid_visuals']
 
 
 def _is_final_recap_segment(seg: NarrationSegment) -> bool:
@@ -1715,8 +2150,65 @@ def _has_mechanical_narration_language(text: str) -> bool:
         '字幕显示',
         '这一步的结果是',
         '推动下一段剧情',
+        '有人说：',
     )
-    return any(phrase in text for phrase in mechanical_phrases)
+    return any(phrase in text for phrase in mechanical_phrases) or _contains_timeline_artifact(text)
+
+
+def _clean_generated_voiceover_artifacts(text: str) -> str:
+    text = str(text or '')
+    text = re.sub(r'有人说[：:]\s*[“"][^”"]+[”"]\s*[，,。；;]?', '', text)
+    text = re.sub(r'有人说[：:]\s*[^，。；;！？!?]+[，,。；;]?', '', text)
+    text = re.sub(r'(?:^|[，,。；;！？!?])\s*\d{2,5}(?:\.\d+)?\s*s?[:：][^。！？!?；;]*[。！？!?；;]?', '。', text)
+    text = re.sub(r'(?<![A-Za-z0-9])\d{2,5}(?:\.\d+)?\s*s?[:：]\s*', '', text)
+    text = re.sub(r'极度…+[。！？!?]?', '极度冷酷的仪式感。', text)
+    text = text.replace('，。', '。').replace('。。', '。').replace('；。', '。')
+    text = text.replace('，更是一次', '。这更是一次')
+    text = re.sub(r'\s+', ' ', text).strip()
+    text = re.sub(r'^[，,。；;]+', '', text)
+    text = re.sub(r'[，,；;]+$', '。', text)
+    if text and text[-1] not in '。！？!?':
+        text += '。'
+    return text
+
+
+def _repair_incomplete_generated_voiceover(
+    text: str,
+    event: StoryEvent | None,
+    idx: int,
+    total: int,
+) -> str:
+    text = _clean_generated_voiceover_artifacts(text)
+    if event is not None and (_generated_voiceover_too_short(text) or _ends_with_incomplete_phrase(text)):
+        return _clean_generated_voiceover_artifacts(_evidence_voiceover(event, idx, total))
+    return text
+
+
+def _generated_voiceover_too_short(text: str) -> bool:
+    cjk_count = len(re.findall(r'[\u4e00-\u9fff]', text or ''))
+    if cjk_count == 0:
+        return not str(text or '').strip()
+    return cjk_count < 24
+
+
+def _ends_with_incomplete_phrase(text: str) -> bool:
+    cleaned = str(text or '').strip('。！？!?，,；; ')
+    return cleaned.endswith((
+        '他们意识到',
+        '他意识到',
+        '她意识到',
+        '真正可怕的是',
+        '更是',
+        '而是',
+        '因为',
+        '所以',
+        '但',
+        '却',
+    ))
+
+
+def _contains_timeline_artifact(text: str) -> bool:
+    return re.search(r'(?<![A-Za-z0-9])\d{2,5}(?:\.\d+)?\s*s?[:：]', text or '') is not None
 
 
 def _strip_repeated_clauses(text: str) -> str:

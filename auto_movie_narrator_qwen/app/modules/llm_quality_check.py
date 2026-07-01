@@ -87,14 +87,23 @@ def _build_review_payload(
     except Exception:
         final_duration = None
     event_map = {event.event_id: event for event in story_events}
-    plan_map = {item.segment_id: item for item in clip_plan}
+    plan_map: dict[int, list[ClipPlanItem]] = {}
+    for item in clip_plan:
+        plan_map.setdefault(item.segment_id, []).append(item)
+    max_voice_end = max((float(item.voice_end or 0.0) for item in clip_plan), default=0.0)
+    timeline_scale = (
+        float(final_duration) / max_voice_end
+        if final_duration is not None and max_voice_end > 0
+        else 1.0
+    )
     used_scene_ids: set[int] = set()
     segments = []
     for seg in script:
         events = [event_map[eid] for eid in seg.source_event_ids if eid in event_map]
         for event in events:
             used_scene_ids.update(event.evidence_scene_ids)
-        plan = plan_map.get(seg.segment_id)
+        plans = sorted(plan_map.get(seg.segment_id, []), key=lambda item: (item.voice_start, item.voice_end))
+        voice_start, voice_end = _voice_span(plans, seg)
         segments.append({
             'segment_id': seg.segment_id,
             'voiceover': seg.voiceover,
@@ -115,7 +124,21 @@ def _build_review_payload(
             'visual_evidence': seg.visual_evidence[:3],
             'recommended_clip': [seg.recommended_clip_start, seg.recommended_clip_end],
             'actual_audio': [seg.audio_start, seg.audio_end],
-            'render_clip': [plan.clip_start, plan.clip_end] if plan else None,
+            'render_clip_count': len(plans),
+            'render_total_duration': round(sum(float(item.target_duration or 0.0) for item in plans), 3),
+            'render_voice_span_before_speedfit': [voice_start, voice_end],
+            'render_estimated_final_span': [
+                round(voice_start * timeline_scale, 3),
+                round(voice_end * timeline_scale, 3),
+            ],
+            'source_clip_windows': [
+                {
+                    'source_time_range': [item.clip_start, item.clip_end],
+                    'voice_time_range_before_speedfit': [item.voice_start, item.voice_end],
+                    'duration': item.target_duration,
+                }
+                for item in plans[:12]
+            ],
         })
 
     return {
@@ -132,6 +155,18 @@ def _build_review_payload(
         'segments': segments,
         'used_scene_ids': sorted(used_scene_ids),
     }
+
+
+def _voice_span(plans: list[ClipPlanItem], seg: NarrationSegment) -> tuple[float, float]:
+    if plans:
+        return (
+            round(min(float(item.voice_start or 0.0) for item in plans), 3),
+            round(max(float(item.voice_end or 0.0) for item in plans), 3),
+        )
+    return (
+        round(float(seg.audio_start or 0.0), 3),
+        round(float(seg.audio_end or 0.0), 3),
+    )
 
 
 def _select_review_images(scene_summaries: list[SceneSummary], used_scene_ids: list[int], limit: int = 12) -> tuple[list[str], list[dict[str, Any]]]:
@@ -169,13 +204,14 @@ def _build_prompt(payload: dict[str, Any]) -> str:
 你是电影解说成片质检员，请基于输入的解说脚本、剧情证据、剪辑计划、规则质检结果，以及附带的九宫格画面证据，做自动质检。
 
 请重点判断：
-1. 解说是否有清晰剧情逻辑，是否像完整 5 分钟电影解说。
+1. 解说是否有清晰剧情逻辑，是否像完整电影解说。
 2. 解说是否被字幕证据和画面证据支持，是否存在明显编造。
 3. 推荐剪辑时间和画面证据是否匹配。
 4. 节奏、旁白长度、字幕/音频完整性是否适合发布。
 5. 是否有严重重复、跳跃、画面与解说不一致、结尾不完整等问题。
 
 附图说明：图片按 checked_images 顺序提供，每张是对应场景的九宫格概览，请结合 scene_id 和 grid_frame_times 评价视觉证据。
+剪辑数据说明：source_clip_windows/source_time_range 是原电影素材时间戳，不是成片时间戳；同一个 segment 可以被拆成多个短镜头。判断音画时长是否匹配时，应看 render_clip_count、render_total_duration、render_voice_span_before_speedfit 和 render_estimated_final_span，不要把单个 source_time_range 当成该段全部画面时长，也不要拿原电影时间戳和最终视频总时长比较。
 
 只输出严格 JSON，字段：
 ok, reviewer, model, overall_score, pass, scores, major_issues, segment_reviews, recommendation。
